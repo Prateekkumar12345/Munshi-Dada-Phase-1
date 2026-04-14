@@ -1,0 +1,9 @@
+torch
+sentence-transformers
+transformers
+tokenizers
+huggingface-hub
+numpy
+streamlit
+pandas
+watchdog
