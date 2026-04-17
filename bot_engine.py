@@ -239,10 +239,10 @@ Respond with ONLY a JSON object containing the intent and any extracted IDs.
 
 === INTENTS ===
 
-1. "present" - Marking attendance as present
+1. "/present" - Marking attendance as present
    Examples: "present", "aa gaya", "main present hu", "aaj aaya hu", "pahunch gaya"
 
-2. "absent" - Marking attendance as absent
+2. "/absent" - Marking attendance as absent
    Examples: "absent", "nahi aa sakta", "chutti", "aaj nahi aaunga"
 
 3. "/tasks" - View tasks
