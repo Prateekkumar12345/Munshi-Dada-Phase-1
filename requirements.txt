@@ -1,9 +1,13 @@
+fastapi
 torch
 sentence-transformers
 transformers
 tokenizers
 huggingface-hub
 numpy
+openai
+pydantic
+python-dotenv
 streamlit
 pandas
 watchdog
