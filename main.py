@@ -112,14 +112,20 @@
 #     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
 
+
+
 """
 main.py — FastAPI backend for Pure Intent Classifier
 Run: uvicorn main:app --reload
 
 Endpoint:
   POST /classify?message=transformer%20ho%20gaya
-  Response: {"intent": "complete_task"}
-  For /complete with ID: {"intent": "/complete", "id": 2}
+  Response examples:
+    - {"intent": "/complete", "id": 2}
+    - {"intent": "/assign", "id": "@8295466423"}
+    - {"intent": "/update", "id": 5}
+    - {"intent": "/issue", "id": 7}
+    - {"intent": "/resolve", "id": 3}
 """
 
 from fastapi import FastAPI, Query
@@ -147,8 +153,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Worker Intent Classifier API",
-    description="Pure intent classifier — returns intent and optional parameters",
-    version="3.1.0",
+    description="Pure intent classifier — returns intent and optional IDs for tasks, updates, issues, resolves, and assigns",
+    version="3.2.0",
     lifespan=lifespan,
 )
 
@@ -158,7 +164,7 @@ app = FastAPI(
 # ─────────────────────────────────────────────────────────────
 class ClassifyResponse(BaseModel):
     intent: str
-    id: Optional[int] = None  # Only for /complete intent
+    id: Optional[Union[int, str]] = None  # Can be numeric ID or string for @mentions
 
 
 # ─────────────────────────────────────────────────────────────
@@ -171,18 +177,21 @@ class ClassifyResponse(BaseModel):
     tags=["Classification"],
 )
 async def classify(
-    message: str = Query(..., description="Message from worker", example="transformer ho gaya")
+    message: str = Query(..., description="Message from worker", example="/complete 2")
 ):
     """
-    Pure intent classifier - Returns intent and optional parameters.
+    Pure intent classifier - Returns intent and optional IDs.
     
     Examples:
-    - "transformer ho gaya" → {"intent": "complete_task"}
-    - "main present hu" → {"intent": "present"}
-    - "/tasks" → {"intent": "/tasks"}
+    - "transformer ho gaya" → {"intent": "/complete", "id": null}
     - "/complete 2" → {"intent": "/complete", "id": 2}
-    - "/complete" → {"intent": "/complete", "id": null}
-    - "wiring mein problem hai" → {"intent": "/issue"}
+    - "/assign @8295466423 wiring karo" → {"intent": "/assign", "id": "@8295466423"}
+    - "/assign 8295466423" → {"intent": "/assign", "id": "8295466423"}
+    - "/update 5 wiring done" → {"intent": "/update", "id": 5}
+    - "/issue 7 generator not working" → {"intent": "/issue", "id": 7}
+    - "/resolve 3" → {"intent": "/resolve", "id": 3}
+    - "/tasks" → {"intent": "/tasks"}
+    - "/present" → {"intent": "/present"}
     """
     
     # First check if it's a slash command
@@ -190,22 +199,22 @@ async def classify(
     
     if command_result:
         intent = command_result.get("intent")
-        task_id = command_result.get("id")
+        extracted_id = command_result.get("id")
         
         # Return response with id if present
-        if task_id is not None:
-            return ClassifyResponse(intent=intent, id=task_id)
+        if extracted_id is not None:
+            return ClassifyResponse(intent=intent, id=extracted_id)
         else:
             return ClassifyResponse(intent=intent)
     
     # Otherwise use GPT for natural language classification
     result = classifier.classify(message)
     intent = result.get("intent", "general_chat")
-    task_id = result.get("id")
+    extracted_id = result.get("id")
     
     # Return response with id if present
-    if task_id is not None:
-        return ClassifyResponse(intent=intent, id=task_id)
+    if extracted_id is not None:
+        return ClassifyResponse(intent=intent, id=extracted_id)
     else:
         return ClassifyResponse(intent=intent)
 
@@ -225,26 +234,53 @@ async def health():
 async def root():
     return {
         "service": "Worker Intent Classifier API",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "endpoint": "POST /classify?message=your_message_here",
         "examples": {
-            "natural_language": {
-                "transformer ho gaya": {"intent": "/complete", "id": None},
-                "main present hu": {"intent": "present"},
-                "wiring mein problem hai": {"intent": "/issue"}
-            },
-            "slash_commands": {
+            "complete_task": {
                 "/complete 2": {"intent": "/complete", "id": 2},
                 "/complete": {"intent": "/complete", "id": None},
+                "transformer ho gaya": {"intent": "/complete", "id": None}
+            },
+            "assign_task": {
+                "/assign @8295466423 wiring karo": {"intent": "/assign", "id": "@8295466423"},
+                "/assign 8295466423": {"intent": "/assign", "id": "8295466423"},
+                "/assign": {"intent": "/assign", "id": None}
+            },
+            "update_task": {
+                "/update 5 wiring done": {"intent": "/update", "id": 5},
+                "/update": {"intent": "/update", "id": None}
+            },
+            "report_issue": {
+                "/issue 7 generator not working": {"intent": "/issue", "id": 7},
+                "/issue": {"intent": "/issue", "id": None}
+            },
+            "resolve_issue": {
+                "/resolve 3": {"intent": "/resolve", "id": 3},
+                "/resolve": {"intent": "/resolve", "id": None}
+            },
+            "other_commands": {
                 "/tasks": {"intent": "/tasks"},
-                "/present": {"intent": "/present"}
+                "/present": {"intent": "/present"},
+                "/absent": {"intent": "/absent"},
+                "/issues": {"intent": "/issues"},
+                "/members": {"intent": "/members"},
+                "/report": {"intent": "/report"},
+                "/help": {"intent": "help"}
             }
         },
         "supported_intents": [
             "present", "absent", "/tasks", "/complete", "/assign", 
             "/update", "/issue", "/issues", "/resolve", "/members", 
             "/report", "help", "general_chat"
-        ]
+        ],
+        "id_types": {
+            "/complete": "numeric (task ID)",
+            "/assign": "string (@mention or phone number)",
+            "/update": "numeric (task ID)",
+            "/issue": "numeric (issue ID)",
+            "/resolve": "numeric (issue ID)"
+        }
     }
 
 

@@ -174,6 +174,19 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 bot_engine.py — Pure Intent Classifier for Worker Assistant
 No database, no worker_id, just intent classification
@@ -212,7 +225,7 @@ class IntentClassifier:
                 {"role": "user", "content": message}
             ],
             temperature=0.2,
-            max_tokens=100,
+            max_tokens=150,
             response_format={"type": "json_object"},
         )
         
@@ -222,7 +235,7 @@ class IntentClassifier:
     def _build_system_prompt(self) -> str:
         return """You are a pure intent classification system.
 Your ONLY job is to classify the user's message into one intent.
-Respond with ONLY a JSON object containing the intent.
+Respond with ONLY a JSON object containing the intent and any extracted IDs.
 
 === INTENTS ===
 
@@ -239,20 +252,24 @@ Respond with ONLY a JSON object containing the intent.
    Examples: "ho gaya", "khatam", "done", "complete", "transformer ho gaya"
    If user provides a number after "complete" like "complete 2" or "/complete 2", extract the ID
 
-5. "/assign" - Assigning a task to someone
-   Examples: "assign", "@user karo", "@all ye kaam karo"
+5. "/assign" - Assigning a task to someone (extract phone number or username)
+   Examples: "assign @8295466423", "@8295466423 ye kaam karo", "assign to 8295466423"
+   Extract the ID (phone number, username, or @mention) after @ symbol or "to"
 
-6. "/update" - Updating a task with a message
-   Examples: "update", "task update", "status update"
+6. "/update" - Updating a task with a message (extract task ID)
+   Examples: "update task 5", "/update 3 wiring done", "task 2 update"
+   Extract the task ID number
 
-7. "/issue" - Reporting an issue
-   Examples: "issue", "problem", "dikkat", "not working"
+7. "/issue" - Reporting an issue (extract issue ID if mentioned)
+   Examples: "issue 7", "/resolve 3", "issue number 2"
+   Extract the issue ID number if present
 
 8. "/issues" - View active issues
    Examples: "issues", "active issues", "problems list"
 
-9. "/resolve" - Resolving an issue
-   Examples: "resolve", "fixed", "solved", "hatado"
+9. "/resolve" - Resolving an issue (extract issue ID)
+   Examples: "resolve 3", "/resolve 2", "issue 5 resolved"
+   Extract the issue ID number
 
 10. "/members" - View team members
     Examples: "members", "team", "sab log"
@@ -267,20 +284,24 @@ Respond with ONLY a JSON object containing the intent.
     Examples: "hello", "hi", "thank you", "bye"
 
 === OUTPUT FORMAT ===
-Respond with ONLY this JSON, nothing else:
+For intents with IDs, respond with:
+{"intent": "<intent_name>", "id": "<id_value>"}
+
+For intents without IDs, respond with:
 {"intent": "<intent_name>"}
 
-For "/complete" intent with an ID, respond with:
-{"intent": "/complete", "id": <number>}
+If an ID is expected but not found, include "id": null
 
-If no ID is provided for "/complete", respond with:
-{"intent": "/complete", "id": null}
-
-Example responses:
+Examples:
 {"intent": "present"}
 {"intent": "/complete", "id": 2}
 {"intent": "/complete", "id": null}
-{"intent": "/issue"}
+{"intent": "/assign", "id": "@8295466423"}
+{"intent": "/assign", "id": null}
+{"intent": "/update", "id": 5}
+{"intent": "/issue", "id": 7}
+{"intent": "/resolve", "id": 3}
+{"intent": "/tasks"}
 """
 
     def _parse_decision(self, raw: str) -> dict:
@@ -319,13 +340,12 @@ class CommandParser:
         if message_lower.startswith("/tasks"):
             return {"intent": "/tasks"}
         
-        # /complete - Extract ID if present
+        # /complete - Extract ID if present (numeric)
         if message_lower.startswith("/complete"):
             # Extract everything after /complete
-            rest = message[9:].strip()  # 9 is length of "/complete"
+            rest = message[9:].strip()
             
             # Try to extract ID (first number in the string)
-            import re
             match = re.search(r'^\d+', rest)
             
             if match:
@@ -334,25 +354,77 @@ class CommandParser:
             else:
                 return {"intent": "/complete", "id": None}
         
-        # /assign
+        # /assign - Extract ID (phone number, username, or @mention)
         if message_lower.startswith("/assign"):
-            return {"intent": "/assign"}
+            # Extract everything after /assign
+            rest = message[7:].strip()
+            
+            # Try to extract @mention or phone number
+            # Pattern for @username or @phone number
+            at_match = re.search(r'@([\d]+)', rest)
+            if at_match:
+                assignee_id = f"@{at_match.group(1)}"
+                return {"intent": "/assign", "id": assignee_id}
+            
+            # Pattern for phone number without @
+            phone_match = re.search(r'(\d{10})', rest)
+            if phone_match:
+                assignee_id = phone_match.group(1)
+                return {"intent": "/assign", "id": assignee_id}
+            
+            # Pattern for username mention
+            username_match = re.search(r'@(\w+)', rest)
+            if username_match:
+                assignee_id = f"@{username_match.group(1)}"
+                return {"intent": "/assign", "id": assignee_id}
+            
+            return {"intent": "/assign", "id": None}
         
-        # /update
+        # /update - Extract task ID (numeric)
         if message_lower.startswith("/update"):
-            return {"intent": "/update"}
+            # Extract everything after /update
+            rest = message[7:].strip()
+            
+            # Try to extract ID (first number in the string)
+            match = re.search(r'^\d+', rest)
+            
+            if match:
+                task_id = int(match.group())
+                return {"intent": "/update", "id": task_id}
+            else:
+                return {"intent": "/update", "id": None}
         
-        # /issue
+        # /issue - Extract issue ID if present (numeric)
         if message_lower.startswith("/issue"):
-            return {"intent": "/issue"}
+            # Extract everything after /issue
+            rest = message[6:].strip()
+            
+            # Try to extract ID (first number in the string)
+            match = re.search(r'^\d+', rest)
+            
+            if match:
+                issue_id = int(match.group())
+                return {"intent": "/issue", "id": issue_id}
+            else:
+                return {"intent": "/issue", "id": None}
         
         # /issues
         if message_lower.startswith("/issues"):
             return {"intent": "/issues"}
         
-        # /resolve
+        # /resolve - Extract issue ID (numeric)
         if message_lower.startswith("/resolve"):
-            return {"intent": "/resolve"}
+            # Extract everything after /resolve
+            rest = message[8:].strip()
+            
+            # Try to extract ID (first number in the string)
+            match = re.search(r'^\d+', rest)
+            
+            if match:
+                issue_id = int(match.group())
+                return {"intent": "/resolve", "id": issue_id}
+            else:
+                return {"intent": "/resolve", "id": None}
         
         # /members
         if message_lower.startswith("/members"):
