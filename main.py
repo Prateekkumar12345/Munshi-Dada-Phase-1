@@ -112,20 +112,12 @@
 #     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
 
-
-
 """
 main.py — FastAPI backend for Pure Intent Classifier
 Run: uvicorn main:app --reload
 
 Endpoint:
-  POST /classify?message=transformer%20ho%20gaya
-  Response examples:
-    - {"intent": "/complete", "id": 2}
-    - {"intent": "/assign", "id": "@8295466423"}
-    - {"intent": "/update", "id": 5}
-    - {"intent": "/issue", "id": 7}
-    - {"intent": "/resolve", "id": 3}
+  POST /classify?message=2%20ghante%20baad%20complete%20karna%20hai
 """
 
 from fastapi import FastAPI, Query
@@ -153,8 +145,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Worker Intent Classifier API",
-    description="Pure intent classifier — returns intent and optional IDs for tasks, updates, issues, resolves, and assigns",
-    version="3.2.0",
+    description="Pure intent classifier — returns intent, IDs, and extracted date/time",
+    version="3.4.0",
     lifespan=lifespan,
 )
 
@@ -164,7 +156,10 @@ app = FastAPI(
 # ─────────────────────────────────────────────────────────────
 class ClassifyResponse(BaseModel):
     intent: str
-    id: Optional[Union[int, str]] = None  # Can be numeric ID or string for @mentions
+    id: Optional[Union[int, str]] = None
+    date: Optional[str] = None  # Date in YYYY-MM-DD format
+    datetime: Optional[str] = None  # Full datetime in ISO format
+    time: Optional[str] = None  # Time in HH:MM:SS format
 
 
 # ─────────────────────────────────────────────────────────────
@@ -173,50 +168,46 @@ class ClassifyResponse(BaseModel):
 @app.post(
     "/classify",
     response_model=ClassifyResponse,
-    summary="Classify worker message intent",
+    summary="Classify worker message intent with date/time extraction",
     tags=["Classification"],
 )
 async def classify(
-    message: str = Query(..., description="Message from worker", example="/complete 2")
+    message: str = Query(..., description="Message from worker", example="2 ghante baad complete karna hai")
 ):
     """
-    Pure intent classifier - Returns intent and optional IDs.
+    Pure intent classifier - Returns intent, IDs, and extracted date/time.
     
     Examples:
-    - "transformer ho gaya" → {"intent": "/complete", "id": null}
-    - "/complete 2" → {"intent": "/complete", "id": 2}
-    - "/assign @8295466423 wiring karo" → {"intent": "/assign", "id": "@8295466423"}
-    - "/assign 8295466423" → {"intent": "/assign", "id": "8295466423"}
-    - "/update 5 wiring done" → {"intent": "/update", "id": 5}
-    - "/issue 7 generator not working" → {"intent": "/issue", "id": 7}
-    - "/resolve 3" → {"intent": "/resolve", "id": 3}
-    - "/tasks" → {"intent": "/tasks"}
-    - "/present" → {"intent": "/present"}
+    - "2 ghante baad complete karna hai" → {"intent": "/complete", "date": "2026-04-18", "datetime": "2026-04-18T15:30:00", "time": "15:30:00"}
+    - "3 hafte mein task khatam karo" → {"intent": "/complete", "date": "2026-05-09", "datetime": "2026-05-09T12:00:00"}
+    - "2 mahine baad report chahiye" → {"intent": "/report", "date": "2026-06-18"}
+    - "1 saal mein promotion" → {"intent": "general_chat", "date": "2027-04-18"}
+    - "aaj mai aaya hu" → {"intent": "/present", "date": "2026-04-18"}
+    - "/complete 2" → {"intent": "/complete", "id": 2, "date": null}
     """
     
     # First check if it's a slash command
     command_result = command_parser.parse(message)
     
     if command_result:
-        intent = command_result.get("intent")
-        extracted_id = command_result.get("id")
-        
-        # Return response with id if present
-        if extracted_id is not None:
-            return ClassifyResponse(intent=intent, id=extracted_id)
-        else:
-            return ClassifyResponse(intent=intent)
+        return ClassifyResponse(
+            intent=command_result.get("intent"),
+            id=command_result.get("id"),
+            date=command_result.get("date"),
+            datetime=command_result.get("datetime"),
+            time=command_result.get("time")
+        )
     
     # Otherwise use GPT for natural language classification
     result = classifier.classify(message)
-    intent = result.get("intent", "general_chat")
-    extracted_id = result.get("id")
     
-    # Return response with id if present
-    if extracted_id is not None:
-        return ClassifyResponse(intent=intent, id=extracted_id)
-    else:
-        return ClassifyResponse(intent=intent)
+    return ClassifyResponse(
+        intent=result.get("intent", "general_chat"),
+        id=result.get("id"),
+        date=result.get("date"),
+        datetime=result.get("datetime"),
+        time=result.get("time")
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -232,55 +223,45 @@ async def health():
 # ─────────────────────────────────────────────────────────────
 @app.get("/", tags=["Meta"])
 async def root():
+    from datetime import datetime
+    now = datetime.now()
+    
     return {
         "service": "Worker Intent Classifier API",
-        "version": "3.2.0",
+        "version": "3.4.0",
         "endpoint": "POST /classify?message=your_message_here",
+        "current_datetime": now.isoformat(),
         "examples": {
-            "complete_task": {
+            "time_based": {
+                "2 ghante baad complete karna hai": {
+                    "intent": "/complete",
+                    "datetime": (now + __import__('datetime').timedelta(hours=2)).isoformat()
+                },
+                "30 minutes mein meeting": {
+                    "intent": "general_chat",
+                    "datetime": (now + __import__('datetime').timedelta(minutes=30)).isoformat()
+                }
+            },
+            "weeks_months_years": {
+                "3 hafte mein task khatam karo": {"intent": "/complete", "date": (now + __import__('datetime').timedelta(weeks=3)).strftime("%Y-%m-%d")},
+                "2 mahine baad report chahiye": {"intent": "/report", "date": "2026-06-18"},
+                "1 saal mein promotion": {"intent": "general_chat", "date": "2027-04-18"}
+            },
+            "relative_dates": {
+                "aaj mai aaya hu": {"intent": "/present", "date": now.strftime("%Y-%m-%d")},
+                "kal nahi aa sakta": {"intent": "/absent", "date": (now + __import__('datetime').timedelta(days=1)).strftime("%Y-%m-%d")},
+                "parso complete karna hai": {"intent": "/complete", "date": (now + __import__('datetime').timedelta(days=2)).strftime("%Y-%m-%d")}
+            },
+            "slash_commands": {
                 "/complete 2": {"intent": "/complete", "id": 2},
-                "/complete": {"intent": "/complete", "id": None},
-                "transformer ho gaya": {"intent": "/complete", "id": None}
-            },
-            "assign_task": {
-                "/assign @8295466423 wiring karo": {"intent": "/assign", "id": "@8295466423"},
-                "/assign 8295466423": {"intent": "/assign", "id": "8295466423"},
-                "/assign": {"intent": "/assign", "id": None}
-            },
-            "update_task": {
-                "/update 5 wiring done": {"intent": "/update", "id": 5},
-                "/update": {"intent": "/update", "id": None}
-            },
-            "report_issue": {
-                "/issue 7 generator not working": {"intent": "/issue", "id": 7},
-                "/issue": {"intent": "/issue", "id": None}
-            },
-            "resolve_issue": {
-                "/resolve 3": {"intent": "/resolve", "id": 3},
-                "/resolve": {"intent": "/resolve", "id": None}
-            },
-            "other_commands": {
-                "/tasks": {"intent": "/tasks"},
-                "/present": {"intent": "/present"},
-                "/absent": {"intent": "/absent"},
-                "/issues": {"intent": "/issues"},
-                "/members": {"intent": "/members"},
-                "/report": {"intent": "/report"},
-                "/help": {"intent": "help"}
+                "/assign @8295466423": {"intent": "/assign", "id": "@8295466423"}
             }
         },
-        "supported_intents": [
-            "present", "absent", "/tasks", "/complete", "/assign", 
-            "/update", "/issue", "/issues", "/resolve", "/members", 
-            "/report", "help", "general_chat"
+        "supported_units": [
+            "seconds (सेकंड)", "minutes (मिनट)", "hours (घंटे)",
+            "days (दिन)", "weeks (हफ्ते)", "months (महीने)", "years (साल)"
         ],
-        "id_types": {
-            "/complete": "numeric (task ID)",
-            "/assign": "string (@mention or phone number)",
-            "/update": "numeric (task ID)",
-            "/issue": "numeric (issue ID)",
-            "/resolve": "numeric (issue ID)"
-        }
+        "supported_languages": ["English", "Hindi", "Hinglish"]
     }
 
 
