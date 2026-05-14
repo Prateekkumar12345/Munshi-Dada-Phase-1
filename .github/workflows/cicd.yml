@@ -6,9 +6,9 @@ on:
       - main
 
 env:
-  DOCKER_USERNAME: anisolepower
+  DOCKER_USERNAME: ajayshakya786
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-  DOCKERHUB_REPO: munshi-dada-intent-extractor
+  DOCKERHUB_REPO: munshi-dada-intent-extracter
   PROJECT_PATH: /home/ubuntu/munshi-dada-intent-extractor
 
 jobs:
