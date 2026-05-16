@@ -2118,6 +2118,13 @@
 #         return None
 
 
+
+
+
+
+
+
+
 """
 bot_engine.py — Pure Intent Classifier for Worker Assistant
 No database, no worker_id, just intent classification with date extraction
@@ -2632,25 +2639,79 @@ class IntentClassifier:
         if self._is_view_tasks_request(message):
             return _build("/tasks")
 
-        # ── PRE-FILTER A: Manager assigns a specific task # to a person ──────
-        # Pattern: "task 32 ajay ko do", "task 45 @rahul ko assign karo"
+        # ─────────────────────────────────────────────────────────────────────
+        # TASK-REFERENCE DETECTION
+        # A "task reference" means the message explicitly talks about a specific
+        # task (by number, word, or ID keyword).  This is the key signal that
+        # separates /mgrassign (person + task ref) from /assign (person + work).
+        #
+        # Matches:
+        #   "task 4", "task id 4", "id 4", "4 number wala task",
+        #   "#4", "task no 4", "task number 4", "4 wala task"
+        # ─────────────────────────────────────────────────────────────────────
+        _TASK_REF_PATTERNS = [
+            r"\btask\s*(id\s*)?\d+",          # "task 4", "task id 4"
+            r"\bid\s*\d+",                     # "id 4", "id4"
+            r"\b\d+\s*(number\s*)?wala\s*task",# "4 wala task", "4 number wala task"
+            r"\btask\s*(no|number|#)\s*\d+",   # "task no 4", "task #4"
+            r"#\d+",                           # "#4"
+            r"\b\d+\s*wala\s*(kaam|task|number)", # "4 wala kaam" (referring to task)
+        ]
+
+        def _has_task_reference(text: str) -> tuple[bool, int | None]:
+            """
+            Returns (True, task_id) if a task reference is found, else (False, None).
+            task_id is the extracted integer if present, else None.
+            """
+            tl = text.lower()
+            for pat in _TASK_REF_PATTERNS:
+                m = re.search(pat, tl, re.IGNORECASE | re.UNICODE)
+                if m:
+                    # Try to extract the number from the matched span
+                    num = re.search(r"\d+", m.group(0))
+                    return True, (int(num.group()) if num else None)
+            return False, None
+
+        has_task_ref, task_ref_id = _has_task_reference(message)
+
+        # Also detect the old "task\s+\d+" pattern used in pre-filter A
         task_id_match = re.search(r"task\s+(\d+)|(\d+)\s+task", ml)
+
+        # ── PRE-FILTER A: Manager assigns a task (by number) to a named person ─
+        # Triggers when: task reference present + person named + assignment verb
+        # "@ajay id 4 wala kaam pura kardo" → /mgrassign (id:4, worker_slug:@ajay)
+        # "task 32 ajay ko do"              → /mgrassign (id:32, worker_slug:ajay)
         assign_keywords = [
             r"ko\s+do", r"ko\s+de", r"ko\s+bhej", r"assign", r"allot",
-            r"de\s+do", r"bhej\s+do",
+            r"de\s+do", r"bhej\s+do", r"pura\s+kar", r"kar\s+do",
+            r"khatam\s+kar", r"complete\s+kar", r"finish\s+kar",
         ]
-        is_mgr_assign = any(re.search(kw, ml) for kw in assign_keywords)
+        is_mgr_assign_verb = any(re.search(kw, ml) for kw in assign_keywords)
 
-        if task_id_match and is_mgr_assign:
-            tid = int(task_id_match.group(1) or task_id_match.group(2))
+        if has_task_ref:
+            # Resolve the task ID — prefer explicit number, fall back to task_id_match
+            tid = task_ref_id
+            if tid is None and task_id_match:
+                tid = int(task_id_match.group(1) or task_id_match.group(2))
+
+            # Named person present → /mgrassign
             at_m = re.search(r"@(\w+)", message)
             if at_m:
                 return _build("/mgrassign", tid, f"@{at_m.group(1)}")
+
             name_match = re.search(
                 r"([A-Za-z\u0900-\u097F]{2,20})\s+ko\b", message, re.UNICODE
             )
             if name_match and name_match.group(1).lower() not in self._NOT_A_NAME:
                 return _build("/mgrassign", tid, name_match.group(1))
+
+            # Old-style "task X + assign verb + name" without @
+            if task_id_match and is_mgr_assign_verb:
+                name_m2 = re.search(
+                    r"([A-Za-z\u0900-\u097F]{2,20})\b", message, re.UNICODE
+                )
+                if name_m2 and name_m2.group(1).lower() not in self._NOT_A_NAME:
+                    return _build("/mgrassign", tid, name_m2.group(1))
 
         # ── PRE-FILTER B: Self-assign — with OR without a task # ─────────────
         # Covers: "task 32 main karunga", "ye kaam mai khud karunga",
@@ -2667,24 +2728,32 @@ class IntentClassifier:
         is_self_assign = any(re.search(p, ml, re.IGNORECASE | re.UNICODE) for p in _SELF_PATTERNS)
 
         if is_self_assign:
-            # Extract task ID if present, else None
-            tid = None
-            if task_id_match:
+            tid = task_ref_id
+            if tid is None and task_id_match:
                 tid = int(task_id_match.group(1) or task_id_match.group(2))
-            else:
+            if tid is None:
                 bare_id = re.search(r"\b(\d+)\b", message)
                 if bare_id:
                     tid = int(bare_id.group(1))
             return _build("/mgrassign", tid, "self")
 
-        # ── PRE-FILTER C: @mention → /assign with worker_slug ─────────────────
+        # ── PRE-FILTER C: @mention + NO task reference → /assign ─────────────
+        # "@ajay warehouse khali karo"  → /assign  (work, no task number)
+        # "@ajay id 4 wala karo"        → already caught above as /mgrassign
         at_m = re.search(r"@(\w+)", message)
         if at_m:
+            # Double-check: if somehow a task ref slipped through, send to /mgrassign
+            if has_task_ref:
+                return _build("/mgrassign", task_ref_id, f"@{at_m.group(1)}")
             return _build("/assign", worker_slug=f"@{at_m.group(1)}")
 
-        # ── PRE-FILTER D: Named person → /assign with worker_slug ─────────────
+        # ── PRE-FILTER D: Named person + NO task reference → /assign ──────────
+        # "ajay ko invoice bhejdo"  → /assign
+        # "ajay ko task 5 do"       → already caught above as /mgrassign
         assignee = self._extract_assignee(message)
         if assignee:
+            if has_task_ref:
+                return _build("/mgrassign", task_ref_id, assignee)
             return _build("/assign", worker_slug=assignee)
 
         # ── PRE-FILTER E0: Self-claim ("I will do this myself") → /selfassign ──
@@ -2804,16 +2873,17 @@ CRITICAL RULES
    ✅ "/tasks" triggers: "mera kaam dikhao", "my tasks", "task list", "kya karna hai"
    ❌ "/tasks" does NOT trigger for: "warehouse khali karo", "invoice bhejo", "500 units send karo"
 
-2. /assign is ONLY when a specific person is named (via @mention or name).
-   - "@ajay invoice bhejdo" → /assign (worker_slug: "@ajay")
-   - "rahul ko kaam do" → /assign (worker_slug: "rahul")
+2. /assign is ONLY when a person is named AND there is NO explicit task reference.
+   - "@ajay warehouse khali karo" → /assign  (work instruction, no task number)
+   - "rahul ko invoice bhejdo"   → /assign  (work instruction, no task number)
 
-3. /depart_assign is for work instructions where NO person is named.
-   - "warehouse khali karo" → /depart_assign (depart_slug: "operations")
-   - "invoice banao" → /depart_assign (depart_slug: "sales")
-   These two are MUTUALLY EXCLUSIVE. Never use /assign without a named person.
-
-4. /mgrassign is ONLY when a specific task NUMBER is given with an assignee, OR self-claim.
+3. /mgrassign is when a person is named AND there IS an explicit task reference
+   (task number, "id X", "#X", "task id X", "X wala task"), OR self-claim.
+   - "@ajay id 4 wala kaam karo"  → /mgrassign  (task ref present)
+   - "task 32 ajay ko do"         → /mgrassign  (task number present)
+   - "@rahul #7 complete karo"    → /mgrassign  (task ref present)
+   - "ye kaam mai khud karunga"   → /mgrassign  (self-claim)
+   RULE: /assign and /mgrassign are mutually exclusive on task reference presence.
 
 ════════════════════════════════════════════════════════
 INTENT CLASSIFICATION RULES
@@ -2822,9 +2892,14 @@ INTENT CLASSIFICATION RULES
 1. "/tasks" — ONLY "view my tasks" requests
    Examples: "mera kaam dikhao", "my tasks", "task list", "pending tasks", "kya karna hai"
 
-2. "/assign" — Work instruction directed at a NAMED person (@mention or name)
-   Examples: "ajay invoice bhejdo", "@rahul warehouse khali kro", "suresh ko purchase karna hai"
-   → Always set worker_slug. Never set depart_slug for this intent.
+2. "/assign" — Work directed at a NAMED person, but NO specific task reference
+   The message mentions a person AND a piece of work (not a specific task number/id).
+   Examples:
+     "@ajay warehouse khali karo"          → /assign (worker_slug: @ajay)
+     "rahul ko invoice bhejdo"             → /assign (worker_slug: rahul)
+     "@priya client ko call karo"          → /assign (worker_slug: @priya)
+   → Always set worker_slug. depart_slug must be null.
+   → KEY: No task ID / task number / "id X" / "#X" in the message.
 
 3. "/depart_assign" — Work instruction with NO named person; route to a department
    Examples: "warehouse khali karo", "500 units bhejdo", "invoice banao", "purchase karo",
@@ -2832,12 +2907,24 @@ INTENT CLASSIFICATION RULES
    → Always set depart_slug to one of: operations, sales, purchase, it
    → worker_slug must be null
 
-4. "/mgrassign" — Assigning a specific task NUMBER to a person, OR self-claiming work
-   With task number + person: "task 32 ajay ko do", "task 45 @rahul ko assign karo"
-   With task number + self:   "task 32 main karunga", "task 10 khud karunga"
-   Without task number (self claimed): "ye kaam main karunga", "main ye kar lunga",
-     "khud karunga", "mai khud dunga", "I will do this", "main sambhal lunga"
-   → For self-claim messages, set worker_slug to "self" and id to null if no number given.
+4. "/mgrassign" — Person named AND an explicit task reference present (task id/number),
+   OR self-claiming work.
+   TASK REFERENCE means: a specific task number, "task X", "id X", "#X",
+   "X wala task", "task id X", "task no X", "X number wala task".
+
+   With task reference + named person:
+     "@ajay id 4 wala kaam pura kardo"    → /mgrassign (id:4,  worker_slug:@ajay)
+     "@ajay task id 4 wala kaam karo"     → /mgrassign (id:4,  worker_slug:@ajay)
+     "task 32 ajay ko do"                 → /mgrassign (id:32, worker_slug:ajay)
+     "task 45 @rahul ko assign karo"      → /mgrassign (id:45, worker_slug:@rahul)
+     "@rahul #7 complete karo"            → /mgrassign (id:7,  worker_slug:@rahul)
+
+   Self-claim (with or without task number):
+     "task 32 main karunga"               → /mgrassign (id:32, worker_slug:self)
+     "ye kaam mai khud karunga"           → /mgrassign (id:null, worker_slug:self)
+
+   → KEY DISTINCTION from /assign: /mgrassign ALWAYS has either a task reference
+     OR worker_slug="self". Plain work instructions to a person = /assign.
 
 5. "/update" — Updating a task with comment/status
 
