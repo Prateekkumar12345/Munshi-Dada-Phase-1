@@ -486,8 +486,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Worker Intent Classifier API",
-    description="Pure intent classifier — returns intent, IDs, extracted date, and professional responses only for general_chat",
-    version="5.0.0",
+    description=(
+        "Pure intent classifier — returns intent, IDs, extracted date, department slug, "
+        "and professional responses only for general_chat"
+    ),
+    version="6.0.0",
     lifespan=lifespan,
 )
 
@@ -496,6 +499,7 @@ class ClassifyResponse(BaseModel):
     intent: str
     id: Optional[Union[int, str]] = None
     worker_slug: Optional[str] = None
+    depart_slug: Optional[str] = None
     deadline: Optional[str] = None
     message: Optional[str] = None
 
@@ -503,7 +507,7 @@ class ClassifyResponse(BaseModel):
 @app.post(
     "/classify",
     response_model=ClassifyResponse,
-    summary="Classify worker message intent with date extraction",
+    summary="Classify worker message intent with date extraction and department routing",
     tags=["Classification"],
 )
 async def classify(
@@ -514,17 +518,20 @@ async def classify(
     )
 ):
     """
-    Pure intent classifier — returns intent, IDs, and extracted deadline.
-    
+    Pure intent classifier — returns intent, IDs, department, and extracted deadline.
+
     **Response Fields:**
-    - `intent`: Classified intent (/tasks, /present, /absent, /complete, /assign, /mgrself, /mgrassign, general_chat, etc.)
-    - `id`: Extracted task ID (for complete, mgrself, mgrassign)
-    - `worker_slug`: Worker username (for /mgrassign command)
+    - `intent`: Classified intent (/tasks, /present, /absent, /complete, /assign, /mgrassign, general_chat, etc.)
+    - `id`: Extracted task ID (for /complete, /mgrassign)
+    - `worker_slug`: Named person (for /assign or /mgrassign when a person is mentioned)
+    - `depart_slug`: Department (for /assign when NO person is mentioned; one of: operations, sales, purchase, it)
     - `deadline`: Extracted deadline in ISO format or YYYY-MM-DD
     - `message`: Professional response (ONLY for general_chat intent)
-    
-    **Important:** All work-related instructions (dispatch, invoice, purchase, warehouse cleanup, etc.)
-    are classified as "/tasks" - NOT as "general_chat".
+
+    **Key behaviour changes in v6:**
+    - `/tasks` is ONLY triggered when the user asks to VIEW their own tasks.
+    - Any work instruction WITHOUT a named person → `/assign` + `depart_slug`
+    - Any work instruction WITH a named person / @mention → `/assign` + `worker_slug`
     """
 
     command_result = command_parser.parse(message)
@@ -533,6 +540,7 @@ async def classify(
             intent=command_result.get("intent"),
             id=command_result.get("id"),
             worker_slug=command_result.get("worker_slug"),
+            depart_slug=command_result.get("depart_slug"),
             deadline=command_result.get("deadline"),
             message=None,
         )
@@ -543,6 +551,7 @@ async def classify(
         intent=result.get("intent", "general_chat"),
         id=result.get("id"),
         worker_slug=result.get("worker_slug"),
+        depart_slug=result.get("depart_slug"),
         deadline=result.get("deadline"),
         message=result.get("message"),
     )
@@ -550,7 +559,7 @@ async def classify(
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return {"status": "ok", "version": "5.0.0"}
+    return {"status": "ok", "version": "6.0.0"}
 
 
 @app.get("/", tags=["Meta"])
@@ -560,46 +569,132 @@ async def root():
 
     return {
         "service": "Worker Intent Classifier API",
-        "version": "5.0.0",
+        "version": "6.0.0",
         "endpoint": "POST /classify?message=your_message_here",
         "current_datetime": now.isoformat(),
-        "whats_new_in_5_0": {
-            "removed_task_field": "The 'task' field has been completely removed from the response body.",
-            "all_tasks_to_tasks_intent": "All work-related instructions (dispatch, invoice, purchase, warehouse cleanup, etc.) are now classified as '/tasks' intent.",
-            "general_chat_only": "The 'general_chat' intent is now ONLY for pure conversation (greetings, small talk, non-work related)."
+        "whats_new_in_6_0": {
+            "tasks_view_only": (
+                "/tasks is now ONLY triggered when the user asks to VIEW their own tasks "
+                "(e.g. 'mera kaam dikhao', 'task list'). Work instructions no longer map to /tasks."
+            ),
+            "assign_with_person": (
+                "Any work instruction with an @mention or named person → /assign with worker_slug set."
+            ),
+            "assign_with_depart_slug": (
+                "Any work instruction with NO named person → /assign with depart_slug set "
+                "(one of: operations, sales, purchase, it)."
+            ),
+            "department_detection": (
+                "Department is detected first by keyword matching, then by LLM if no keyword matches."
+            ),
         },
+        "departments": ["operations", "sales", "purchase", "it"],
         "response_examples": {
-            "operational_task": {
+            "work_instruction_no_person": {
                 "input": "kal subah 10 bje tak warehouse khali krdo",
                 "response": {
-                    "intent": "/tasks",
-                    "deadline": "2026-05-16T10:00:00",
-                    "message": None
-                }
+                    "intent": "/assign",
+                    "id": None,
+                    "worker_slug": None,
+                    "depart_slug": "operations",
+                    "deadline": "2026-05-17T10:00:00",
+                    "message": None,
+                },
             },
-            "dispatch_task": {
-                "input": "send 500 units before evening",
+            "work_instruction_with_mention": {
+                "input": "kal subah 10 bje tak warehouse khali krdo @ajay",
+                "response": {
+                    "intent": "/assign",
+                    "id": None,
+                    "worker_slug": "@ajay",
+                    "depart_slug": None,
+                    "deadline": "2026-05-17T10:00:00",
+                    "message": None,
+                },
+            },
+            "work_instruction_with_name": {
+                "input": "ajay ko invoice bhejdo",
+                "response": {
+                    "intent": "/assign",
+                    "id": None,
+                    "worker_slug": "ajay",
+                    "depart_slug": None,
+                    "deadline": None,
+                    "message": None,
+                },
+            },
+            "sales_task_no_person": {
+                "input": "invoice banao aur client ko bhejo",
+                "response": {
+                    "intent": "/assign",
+                    "id": None,
+                    "worker_slug": None,
+                    "depart_slug": "sales",
+                    "deadline": None,
+                    "message": None,
+                },
+            },
+            "purchase_task_no_person": {
+                "input": "raw material kharido 500 units",
+                "response": {
+                    "intent": "/assign",
+                    "id": None,
+                    "worker_slug": None,
+                    "depart_slug": "purchase",
+                    "deadline": None,
+                    "message": None,
+                },
+            },
+            "it_task_no_person": {
+                "input": "server down hai theek karo",
+                "response": {
+                    "intent": "/assign",
+                    "id": None,
+                    "worker_slug": None,
+                    "depart_slug": "it",
+                    "deadline": None,
+                    "message": None,
+                },
+            },
+            "view_tasks": {
+                "input": "mera kaam dikhao",
                 "response": {
                     "intent": "/tasks",
-                    "deadline": "2026-05-15",
-                    "message": None
-                }
+                    "id": None,
+                    "worker_slug": None,
+                    "depart_slug": None,
+                    "deadline": None,
+                    "message": None,
+                },
             },
             "attendance": {
                 "input": "aaj main aa gaya hu",
                 "response": {
                     "intent": "/present",
-                    "deadline": "2026-05-15",
-                    "message": None
-                }
+                    "deadline": "2026-05-16",
+                    "message": None,
+                },
+            },
+            "mgrassign": {
+                "input": "task 32 @ajay ko do",
+                "response": {
+                    "intent": "/mgrassign",
+                    "id": 32,
+                    "worker_slug": "@ajay",
+                    "depart_slug": None,
+                    "deadline": None,
+                    "message": None,
+                },
             },
             "general_chat": {
                 "input": "hello kaise ho",
                 "response": {
                     "intent": "general_chat",
-                    "message": "Main aapki baat samajh gaya. Main yeh sab kar sakta hoon:\n\n• Tasks manage karna (/tasks, /complete, /assign)\n• Reports generate karna (/report)\n..."
-                }
-            }
+                    "worker_slug": None,
+                    "depart_slug": None,
+                    "message": "Thank you for your message. Main task management aur team coordination mein help kar sakta hoon...",
+                },
+            },
         },
         "supported_languages": ["English", "Hindi", "Hinglish"],
     }

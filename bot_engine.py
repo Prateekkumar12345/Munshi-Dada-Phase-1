@@ -2118,8 +2118,6 @@
 #         return None
 
 
-
-
 """
 bot_engine.py — Pure Intent Classifier for Worker Assistant
 No database, no worker_id, just intent classification with date extraction
@@ -2382,6 +2380,76 @@ class DateTimeExtractor:
 
 
 # ─────────────────────────────────────────────────────────────
+# DEPARTMENT CLASSIFIER
+# ─────────────────────────────────────────────────────────────
+
+# Keyword-based department detection (fast pre-filter before LLM)
+DEPARTMENT_KEYWORDS = {
+    "operations": [
+        # English
+        "warehouse", "dispatch", "delivery", "logistics", "shipment", "inventory",
+        "stock", "loading", "unloading", "transport", "vehicle", "driver", "packing",
+        "production", "manufacturing", "quality", "inspection", "shift", "machine",
+        "equipment", "maintenance", "repair", "store", "godown", "khali",
+        # Hinglish / Hindi
+        "godam", "maal", "samaan", "bhejo", "bhej", "load", "unload",
+        "gaadi", "truck", "tempo", "delivery karo", "pack", "packaging",
+        "units", "khali kro", "khali karo", "safai", "clean", "cleaning",
+    ],
+    "sales": [
+        # English
+        "invoice", "order", "client", "customer", "quotation", "quote", "deal",
+        "sales", "revenue", "payment", "collection", "follow up", "followup",
+        "lead", "prospect", "visit", "meeting", "demo", "proposal",
+        # Hinglish / Hindi
+        "invoice banao", "bill banao", "order aaya", "customer ko",
+        "client ko", "collection karo", "payment lao", "becho", "bechna",
+        "bikri", "sale", "graahaak", "grahak",
+    ],
+    "purchase": [
+        # English
+        "purchase", "buy", "procure", "procurement", "vendor", "supplier",
+        "order place", "raw material", "material", "sourcing", "price",
+        "quotation from", "rate", "cost",
+        # Hinglish / Hindi
+        "kharido", "kharidna", "kharid", "mangao", "mangana",
+        "order karo", "supplier se", "vendor se", "material lao",
+        "saman mangao", "rate puchho", "rate pata karo", "khareedna",
+    ],
+    "it": [
+        # English
+        "server", "system", "computer", "laptop", "software", "hardware",
+        "network", "internet", "wifi", "password", "login", "access",
+        "email", "website", "app", "application", "database", "backup",
+        "install", "update software", "bug", "error", "crash", "printer",
+        # Hinglish / Hindi
+        "computer theek karo", "laptop kharab", "internet nahi",
+        "wifi nahi chal", "password reset", "software install",
+        "system slow", "it team", "tech support",
+    ],
+}
+
+
+def detect_department_by_keywords(message: str) -> str | None:
+    """
+    Fast keyword-based department detection.
+    Returns department name or None if no match found.
+    """
+    ml = message.lower()
+    scores = {dept: 0 for dept in DEPARTMENT_KEYWORDS}
+
+    for dept, keywords in DEPARTMENT_KEYWORDS.items():
+        for kw in keywords:
+            if kw in ml:
+                scores[dept] += 1
+
+    best = max(scores, key=scores.get)
+    if scores[best] > 0:
+        return best
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
 # PROFESSIONAL RESPONSE GENERATOR (Only for general_chat)
 # ─────────────────────────────────────────────────────────────
 
@@ -2407,7 +2475,8 @@ def get_professional_response(message: str, date_info: dict = None) -> str:
     
     # Default response for general_chat
     return (
-        f"Thank you for your message. Main task management aur team coordination mein help kar sakta hoon.Saare available commands dekhne ke liye help type karo.Batao, main aapki kya help kar sakta hoon?"
+        f"Thank you for your message. Main task management aur team coordination mein help kar sakta hoon. "
+        f"Saare available commands dekhne ke liye help type karo. Batao, main aapki kya help kar sakta hoon?"
     )
 
 
@@ -2439,6 +2508,26 @@ class IntentClassifier:
         "ok", "okay", "sure", "yes", "no",
     }
 
+    # ── Keywords that indicate the user is VIEWING their own tasks ──
+    _VIEW_TASKS_PATTERNS = [
+        r"\b(mera|mere|meri)\s+(kaam|task|tasks)\b",
+        r"\b(my\s+tasks?|my\s+work)\b",
+        r"\btask\s*(list|dikhao|show|dekh|kya\s+hai|kya\s+hain)\b",
+        r"\b(kaam\s+dikhao|kaam\s+batao|kaam\s+kya\s+hai)\b",
+        r"\b(pending\s+tasks?|kya\s+karna\s+hai|aaj\s+kya\s+karna\s+hai)\b",
+        r"\b(show\s+tasks?|list\s+tasks?|view\s+tasks?)\b",
+        r"\bkaam\s+dekh\b",
+    ]
+
+    @staticmethod
+    def _is_view_tasks_request(message: str) -> bool:
+        """Returns True only if the user is asking to VIEW their own tasks."""
+        ml = message.lower().strip()
+        for pattern in IntentClassifier._VIEW_TASKS_PATTERNS:
+            if re.search(pattern, ml, re.IGNORECASE | re.UNICODE):
+                return True
+        return False
+
     @staticmethod
     def _extract_assignee(message: str) -> str | None:
         """Return the assignee slug if the message is directed at a specific person."""
@@ -2449,109 +2538,216 @@ class IntentClassifier:
 
         msg_lower = message.lower().strip()
 
-        # Priority 2: "name ko ..." pattern (but not task-related)
-        # Check if it's a work instruction
-        work_keywords = ['task', 'kaam', 'invoice', 'bhej', 'send', 'do', 'karo']
-        has_work = any(kw in msg_lower for kw in work_keywords)
-        
-        if has_work:
-            m = re.match(r"^([A-Za-z\u0900-\u097F]{2,20})\s+ko\b", message, re.IGNORECASE | re.UNICODE)
-            if m and m.group(1).lower() not in IntentClassifier._NOT_A_NAME:
-                return m.group(1)
+        # Priority 2: "name ko ..." or "name se ..." pattern with work instruction
+        # Any work-related message with a name qualifies now
+        name_ko = re.match(
+            r"^([A-Za-z\u0900-\u097F]{2,20})\s+ko\b",
+            message, re.IGNORECASE | re.UNICODE
+        )
+        if name_ko and name_ko.group(1).lower() not in IntentClassifier._NOT_A_NAME:
+            return name_ko.group(1)
 
-            m = re.match(r"^([A-Za-z\u0900-\u097F]{2,20})\s+se\b", message, re.IGNORECASE | re.UNICODE)
-            if m and m.group(1).lower() not in IntentClassifier._NOT_A_NAME:
-                return m.group(1)
+        name_se = re.match(
+            r"^([A-Za-z\u0900-\u097F]{2,20})\s+se\b",
+            message, re.IGNORECASE | re.UNICODE
+        )
+        if name_se and name_se.group(1).lower() not in IntentClassifier._NOT_A_NAME:
+            return name_se.group(1)
+
+        # Priority 3: name anywhere mid-sentence with "ko" followed by a verb
+        mid_ko = re.search(
+            r"\b([A-Za-z\u0900-\u097F]{2,20})\s+ko\s+\w",
+            message, re.IGNORECASE | re.UNICODE
+        )
+        if mid_ko and mid_ko.group(1).lower() not in IntentClassifier._NOT_A_NAME:
+            return mid_ko.group(1)
 
         return None
+
+    def _classify_department_via_llm(self, message: str) -> str:
+        """
+        Ask the LLM to pick the best department for a work instruction
+        that has no named assignee.
+        Returns one of: operations, sales, purchase, it
+        """
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a department classifier for a factory/business WhatsApp bot. "
+                        "Given a work instruction in English, Hindi, or Hinglish, classify it into "
+                        "exactly ONE of these departments: operations, sales, purchase, it\n\n"
+                        "Department definitions:\n"
+                        "- operations: warehouse, dispatch, delivery, logistics, inventory, stock, "
+                        "loading/unloading, transport, production, manufacturing, machine maintenance, "
+                        "cleaning, packaging, godown/store management\n"
+                        "- sales: invoices, orders, customer/client handling, payment collection, "
+                        "quotations, leads, sales targets, billing\n"
+                        "- purchase: buying raw materials, procurement, vendor/supplier management, "
+                        "price comparisons, sourcing, material orders\n"
+                        "- it: computers, laptops, servers, software, network/internet, passwords, "
+                        "printers, applications, tech support\n\n"
+                        "Respond with ONLY one word (the department name). No explanation."
+                    ),
+                },
+                {"role": "user", "content": message},
+            ],
+            temperature=0.0,
+            max_tokens=10,
+        )
+        dept = response.choices[0].message.content.strip().lower()
+        valid = {"operations", "sales", "purchase", "it"}
+        return dept if dept in valid else "operations"  # default fallback
 
     def classify(self, message: str) -> dict:
         """
         Classify intent using a layered approach:
-        
+
         Layer 1 — Deterministic Python pre-filters:
-          a) Task + assignee pattern (task X to Y, task X for Y) → /mgrassign
-          b) Direct assignment (@mention or name) → /assign  
-          c) Attendance words → /present / /absent
-          d) Past-tense completion → /complete
-        
+          a) View tasks request → /tasks
+          b) Task + assignee pattern (task X to Y) → /mgrassign
+          c) Any @mention or name with work → /assign (with worker_slug)
+          d) Attendance words → /present / /absent
+          e) Past-tense completion → /complete
+          f) Work instruction with NO person → /assign (with depart_slug)
+
         Layer 2 — LLM for everything remaining.
         """
         datetime_info = self.datetime_extractor.extract_date_from_message(message)
         ml = message.lower()
 
-        def _build(intent, id_=None, worker_slug=None, message_text=None):
-            result = {
+        def _build(intent, id_=None, worker_slug=None, depart_slug=None, message_text=None):
+            return {
                 "intent": intent,
                 "id": id_,
                 "worker_slug": worker_slug,
+                "depart_slug": depart_slug,
                 "deadline": datetime_info.get("deadline"),
                 "message": message_text,
             }
-            return result
 
-        # ── PRE-FILTER A: Task assignment with manager intent ────────────────
-        # Pattern: "task 32 ajay ko do", "invoice bhejdo @ajay", "ajay ko task 32 de do"
+        # ── PRE-FILTER 0: /tasks — view-only ─────────────────────────────────
+        if self._is_view_tasks_request(message):
+            return _build("/tasks")
+
+        # ── PRE-FILTER A: Manager assigns a specific task # to a person ──────
+        # Pattern: "task 32 ajay ko do", "task 45 @rahul ko assign karo"
         task_id_match = re.search(r"task\s+(\d+)|(\d+)\s+task", ml)
-        
-        # Check if message contains assignment intent
         assign_keywords = [
-            r"ko\s+do", r"ko\s+de", r"ko\s+bhej", r"ko\s+sau,",
-            r"assign", r"allot", r"de\s+do", r"bhej\s+do"
+            r"ko\s+do", r"ko\s+de", r"ko\s+bhej", r"assign", r"allot",
+            r"de\s+do", r"bhej\s+do",
         ]
-        
-        is_assignment = any(re.search(kw, ml) for kw in assign_keywords)
-        
-        if task_id_match and is_assignment:
+        is_mgr_assign = any(re.search(kw, ml) for kw in assign_keywords)
+
+        if task_id_match and is_mgr_assign:
             tid = int(task_id_match.group(1) or task_id_match.group(2))
-            # Extract assignee
             at_m = re.search(r"@(\w+)", message)
             if at_m:
-                worker_slug = f"@{at_m.group(1)}"
-                return _build("/mgrassign", tid, worker_slug)
+                return _build("/mgrassign", tid, f"@{at_m.group(1)}")
+            name_match = re.search(
+                r"([A-Za-z\u0900-\u097F]{2,20})\s+ko\b", message, re.UNICODE
+            )
+            if name_match and name_match.group(1).lower() not in self._NOT_A_NAME:
+                return _build("/mgrassign", tid, name_match.group(1))
+
+        # ── PRE-FILTER B: Self-assign — with OR without a task # ─────────────
+        # Covers: "task 32 main karunga", "ye kaam mai khud karunga",
+        #         "main ye kar lunga", "I will do this", "mai khud dunga"
+        _SELF_PATTERNS = [
+            r"\b(main|mai|mein|me)\s+(karunga|kar\s+lunga|kar\s+leta\s+hu|karunga|kar\s+dunga|khud\s+karunga)\b",
+            r"\bkhud\s+(karunga|kar\s+lunga|kar\s+leta|karega|dunga|karunga)\b",
+            r"\b(i\s+will\s+do|i\s+will\s+take|i['']ll\s+do|i\s+will\s+handle|myself)\b",
+            r"\b(main|mai)\s+khud\b",
+            r"\bkhud\s+(main|mai|mein)\b",
+            r"\bapne\s+aap\s+(karunga|kar\s+lunga|se\s+kar)\b",
+            r"\b(le\s+leta\s+hu|le\s+lunga|kar\s+lunga|nipta\s+lunga|sambhal\s+lunga)\b",
+        ]
+        is_self_assign = any(re.search(p, ml, re.IGNORECASE | re.UNICODE) for p in _SELF_PATTERNS)
+
+        if is_self_assign:
+            # Extract task ID if present, else None
+            tid = None
+            if task_id_match:
+                tid = int(task_id_match.group(1) or task_id_match.group(2))
             else:
-                # Check for name without @
-                name_match = re.search(r"([A-Za-z\u0900-\u097F]{2,20})\s+ko\b", message, re.UNICODE)
-                if name_match and name_match.group(1).lower() not in self._NOT_A_NAME:
-                    return _build("/mgrassign", tid, name_match.group(1))
-        
-        # ── PRE-FILTER B: Self assignment (no @, but worker is self) ──────────
-        # Pattern: "task 32 main karunga", "task 32 khud karunga"
-        if task_id_match:
-            tid = int(task_id_match.group(1) or task_id_match.group(2))
-            self_keywords = [r"main\s+karunga", r"khud\s+karunga", r"myself", 
-                           r"i\s+will\s+do", r"i\s+will\s+take"]
-            
-            for keyword in self_keywords:
-                if re.search(keyword, ml, re.IGNORECASE):
-                    return _build("/mgrassign", tid, "self")
-        
-        # ── PRE-FILTER C: Simple assignment (person mentioned, no task #) ─────
-        # Pattern: "@ajay invoice bhejdo" or "ajay ko invoice bhejdo"
+                bare_id = re.search(r"\b(\d+)\b", message)
+                if bare_id:
+                    tid = int(bare_id.group(1))
+            return _build("/mgrassign", tid, "self")
+
+        # ── PRE-FILTER C: @mention → /assign with worker_slug ─────────────────
         at_m = re.search(r"@(\w+)", message)
         if at_m:
-            assignee = f"@{at_m.group(1)}"
-            # Check if it's a work instruction
-            work_keywords = ['task', 'kaam', 'invoice', 'bhej', 'send', 'do', 'karo', 'ban', 'clear', 'purchase']
-            if any(kw in ml for kw in work_keywords):
-                return _build("/assign", worker_slug=assignee)
-        
-        # Name-based assign (no @, but person clearly named with work instruction)
-        assignee = IntentClassifier._extract_assignee(message)
+            return _build("/assign", worker_slug=f"@{at_m.group(1)}")
+
+        # ── PRE-FILTER D: Named person → /assign with worker_slug ─────────────
+        assignee = self._extract_assignee(message)
         if assignee:
             return _build("/assign", worker_slug=assignee)
 
-        # ── PRE-FILTER D: Attendance ─────────────────────────────────────────
-        if re.search(r"\b(present\s+hu|aa\s+gaya|aaya\s+hu|pahunch\s+gaya|aaj\s+aaya|i\s+am\s+here|mai\s+aa\s+gaya|main\s+aa\s+gaya)\b", ml, re.IGNORECASE | re.UNICODE):
+        # ── PRE-FILTER E0: Self-claim ("I will do this myself") → /selfassign ──
+        # Handles: "ye kaam mai khud karunga", "main karunga", "I will do it", etc.
+        # NOTE: If a specific task ID is also present, PRE-FILTER B above already
+        #       handles it as /mgrassign with worker_slug="self". This filter catches
+        #       the case where NO task number is mentioned.
+        _SELF_CLAIM_PATTERNS = [
+            r"\b(main|mai|mein|i)\s+(karunga|karungi|kar\s+leta|kar\s+leti|kar\s+lunga|kar\s+lungi|karunga|karungi)\b",
+            r"\b(khud\s+karunga|khud\s+karungi|khud\s+kar\s+leta|khud\s+kar\s+leti)\b",
+            r"\b(main|mai)\s+khud\b",
+            r"\bkhud\s+(main|mai|me)\b",
+            r"\bi\s+will\s+(do|handle|take\s+care|manage)\b",
+            r"\bi'?ll\s+(do|handle|take\s+care|manage)\b",
+            r"\bmyself\s+(karunga|karungi|kar\s+leta|kar\s+lunga)\b",
+            r"\b(le\s+leta|le\s+lunga|le\s+lungi)\b",  # "main le leta hu"
+        ]
+        is_self_claim = any(
+            re.search(p, ml, re.IGNORECASE | re.UNICODE)
+            for p in _SELF_CLAIM_PATTERNS
+        )
+        # Make sure there's no task number (those go
+        if re.search(
+            r"\b(present\s+hu|aa\s+gaya|aaya\s+hu|pahunch\s+gaya|aaj\s+aaya|i\s+am\s+here|mai\s+aa\s+gaya|main\s+aa\s+gaya)\b",
+            ml, re.IGNORECASE | re.UNICODE,
+        ):
             return _build("/present")
 
-        if re.search(r"\b(absent\s+hu|nahi\s+aa\s+sakta|chutti\s+chahiye|chutti\s+le|leave\s+chahiye|aaj\s+nahi\s+aaunga|nahi\s+aa\s+pa|nahi\s+aaonga)\b", ml, re.IGNORECASE | re.UNICODE):
+        if re.search(
+            r"\b(absent\s+hu|nahi\s+aa\s+sakta|chutti\s+chahiye|chutti\s+le|leave\s+chahiye|aaj\s+nahi\s+aaunga|nahi\s+aa\s+pa|nahi\s+aaonga)\b",
+            ml, re.IGNORECASE | re.UNICODE,
+        ):
             return _build("/absent")
 
-        # ── PRE-FILTER E: Task completion (past tense) ───────────────────────
-        if re.search(r"\b(ho\s+gaya|kar\s+diya|khatam\s+ho\s+gaya|complete\s+ho\s+gaya|complete\s+kar\s+diya|khatam\s+kiya|done\s+hai|finished)\b", ml, re.IGNORECASE | re.UNICODE):
+        # ── PRE-FILTER F: Past-tense completion ──────────────────────────────
+        if re.search(
+            r"\b(ho\s+gaya|kar\s+diya|khatam\s+ho\s+gaya|complete\s+ho\s+gaya|complete\s+kar\s+diya|khatam\s+kiya|done\s+hai|finished)\b",
+            ml, re.IGNORECASE | re.UNICODE,
+        ):
             id_m = re.search(r"\b(\d+)\b", message)
             return _build("/complete", int(id_m.group(1)) if id_m else None)
+
+        # ── PRE-FILTER G: Work instruction with NO person → /assign + depart_slug
+        # Detect whether the message sounds like a work instruction at all
+        work_instruction_patterns = [
+            r"\b(bhejo|bhej|karo|karna|krdo|krdena|banao|banana|lao|lana|chalao|chalana|"
+            r"safai|clean|clear|pack|load|unload|dispatch|deliver|send|purchase|buy|"
+            r"kharido|mangao|install|fix|check|repair|khali)\b",
+            r"\b(units?|maal|samaan|invoice|order|shipment|warehouse|godown|machine|"
+            r"computer|laptop|server|material|stock)\b",
+        ]
+        is_work_instruction = any(
+            re.search(p, ml, re.IGNORECASE | re.UNICODE)
+            for p in work_instruction_patterns
+        )
+
+        if is_work_instruction:
+            # Try fast keyword detection first
+            dept = detect_department_by_keywords(message)
+            if dept is None:
+                # Fall back to LLM department classification
+                dept = self._classify_department_via_llm(message)
+            return _build("/assign", depart_slug=dept)
 
         # ── LLM: handle everything remaining ─────────────────────────────────
         response = client.chat.completions.create(
@@ -2570,12 +2766,20 @@ class IntentClassifier:
 
         intent = result.get("intent", "general_chat")
         result["deadline"] = datetime_info.get("deadline")
+        result.setdefault("depart_slug", None)
 
         # Message ONLY for general_chat intent
         if intent == "general_chat":
             result["message"] = get_professional_response(message, datetime_info)
         else:
             result["message"] = None
+
+        # If LLM returned /assign with no person and work context, add dept
+        if intent == "/assign" and not result.get("worker_slug"):
+            dept = detect_department_by_keywords(message)
+            if dept is None:
+                dept = self._classify_department_via_llm(message)
+            result["depart_slug"] = dept
 
         return result
 
@@ -2585,88 +2789,65 @@ Your ONLY job is to classify the user's message into exactly one intent and extr
 Respond with ONLY a valid JSON object. No text, no markdown, no explanations.
 
 ════════════════════════════════════════════════════════
-CRITICAL RULE FOR CLASSIFICATION
+CRITICAL RULES
 ════════════════════════════════════════════════════════
 
-**When a person is mentioned with a work instruction, it's ALWAYS /assign or /mgrassign, NOT /tasks**
+1. /tasks is ONLY for viewing your own task list. NOT for work instructions.
+   ✅ "/tasks" triggers: "mera kaam dikhao", "my tasks", "task list", "kya karna hai"
+   ❌ "/tasks" does NOT trigger for: "warehouse khali karo", "invoice bhejo", "500 units send karo"
 
-Examples of /assign (person assigned work without task number):
-- "ajay invoice bhejdo" → /assign (assignee: ajay)
-- "@rahul warehouse khali kro" → /assign (assignee: @rahul)
-- "suresh ko purchase karna hai" → /assign (assignee: suresh)
-- "mohit se ye kaam karwao" → /assign (assignee: mohit)
+2. /assign is for ALL work instructions — with or without a named person.
+   - With a named person (worker_slug set): "@ajay invoice bhejdo", "rahul ko kaam do"
+   - Without a named person (depart_slug set): "warehouse khali karo", "invoice banao"
 
-Examples of /mgrassign (specific task number + person):
-- "task 32 ajay ko do" → /mgrassign (id: 32, worker_slug: ajay)
-- "task 45 @rahul ko assign karo" → /mgrassign (id: 45, worker_slug: @rahul)
-- "task 50 main karunga" → /mgrassign (id: 50, worker_slug: "self")
-
-Examples of /tasks (viewing tasks, NO person assigned):
-- "kaam dikhao" → /tasks
-- "mera kaam kya hai" → /tasks
-- "task list" → /tasks
-- "500 units bhejdo" → /tasks (work instruction without assignee)
-- "warehouse khali krdo" → /tasks (work instruction without assignee)
-- "invoice banao" → /tasks (work instruction without assignee)
-
-════════════════════════════════════════════════════════
-IMPORTANT NOTE
-════════════════════════════════════════════════════════
-The following have ALREADY been handled by Python pre-filters and will NOT appear here:
-- Messages with @mention + work instruction → already /assign
-- Messages with "name ko" + work instruction → already /assign
-- Messages with "task X" + assignee pattern → already /mgrassign
-- Messages with "task X" + "main karunga" → already /mgrassign (self)
-- Past tense completion ("ho gaya", "khatam") → already /complete
-- Attendance phrases ("present hu", "aa gaya") → already /present or /absent
-
-You only handle ambiguous or general messages that didn't match those patterns.
+3. /mgrassign is ONLY when a specific task NUMBER is given with an assignee.
 
 ════════════════════════════════════════════════════════
 INTENT CLASSIFICATION RULES
 ════════════════════════════════════════════════════════
 
-1. "/tasks" — View tasks OR general work instruction with NO person mentioned
-   Examples: "kaam dikhao", "mera kaam", "task list", "500 units bhejdo", 
-             "warehouse khali krdo", "invoice banao", "purchase karo"
+1. "/tasks" — ONLY "view my tasks" requests
+   Examples: "mera kaam dikhao", "my tasks", "task list", "pending tasks", "kya karna hai"
 
-2. "/assign" — Assign work to a person (no specific task number mentioned)
-   Examples: "ajay invoice bhejdo", "@rahul warehouse khali kro"
+2. "/assign" — Assign work to a person OR department (any work instruction)
+   With person: "ajay invoice bhejdo", "@rahul warehouse khali kro"
+   Without person: "warehouse khali karo", "500 units bhejdo", "invoice banao", "purchase karo"
+   → For no-person messages, set depart_slug to one of: operations, sales, purchase, it
 
-3. "/mgrassign" — Manager assigning a specific task number (ALWAYS includes task ID)
-   Examples: "task 32 ajay ko do", "task 45 @rahul ko assign karo"
+3. "/mgrassign" — Assigning a task to someone, OR claiming a task for yourself ("self")
+   With task number + person: "task 32 ajay ko do", "task 45 @rahul ko assign karo"
+   With task number + self:   "task 32 main karunga", "task 10 khud karunga"
+   Without task number (self claimed): "ye kaam main karunga", "main ye kar lunga",
+     "khud karunga", "mai khud dunga", "I will do this", "main sambhal lunga"
+   → For self-claim messages, set worker_slug to "self" and id to null if no number given.
 
 4. "/update" — Updating a task with comment/status
-   Examples: "update karo", "comment add karo", "status update"
 
 5. "/issue" — Reporting a new issue
-   Examples: "issue hai", "problem hai", "kuch kharab hai", "machine kharab"
+   Examples: "issue hai", "machine kharab", "kuch kharab hai"
 
 6. "/issues" — View all active issues
-   Examples: "issues dikhao", "problems list", "saare issues"
 
 7. "/resolve" — Marking an issue as resolved
-   Examples: "resolve ho gaya", "fix ho gaya", "theek ho gaya"
 
 8. "/members" — View team members
-   Examples: "team dikhao", "members", "kaun kaun hai", "sab log"
 
 9. "/report" — Generate a report
-   Examples: "report chahiye", "summary do", "report nikal"
 
 10. "/help" — Need help with commands
-    Examples: "help", "commands", "kya kar sakta hu", "kaise use karein"
 
-11. "general_chat" — Pure conversation, greetings, small talk, or anything not work-related
-    Examples: "hello", "hi", "kaise ho", "good morning", "mausam kaisa hai", "shukriya"
+11. "general_chat" — ONLY pure conversation: greetings, small talk, non-work
+    Examples: "hello", "hi", "kaise ho", "good morning", "shukriya"
 
 ════════════════════════════════════════════════════════
 OUTPUT FORMAT
 ════════════════════════════════════════════════════════
-{"intent": "<intent_name>", "id": <int or null>, "worker_slug": "<@username or 'self' or null>"}
+{"intent": "<intent_name>", "id": <int or null>, "worker_slug": "<@username, name, or null>", "depart_slug": "<operations|sales|purchase|it|null>"}
 
-Valid intent names:
-/tasks, /assign, /mgrassign, /update, /issue, /issues, /resolve, /members, /report, /help, general_chat
+Rules:
+- worker_slug: set when a specific person is named
+- depart_slug: set when NO person is named but it's a work instruction
+- Both can be null for non-assign intents
 """
 
     def _parse_decision(self, raw: str) -> dict:
@@ -2677,7 +2858,7 @@ Valid intent names:
             try:
                 return json.loads(clean)
             except Exception:
-                return {"intent": "general_chat", "id": None, "worker_slug": None}
+                return {"intent": "general_chat", "id": None, "worker_slug": None, "depart_slug": None}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2693,11 +2874,12 @@ class CommandParser:
 
         datetime_info = self.datetime_extractor.extract_date_from_message(message)
 
-        def base(intent, id_=None, worker_slug=None):
+        def base(intent, id_=None, worker_slug=None, depart_slug=None):
             return {
                 "intent": intent,
                 "id": id_,
                 "worker_slug": worker_slug,
+                "depart_slug": depart_slug,
                 "deadline": datetime_info.get("deadline"),
                 "message": None,
             }
@@ -2733,7 +2915,6 @@ class CommandParser:
             return base("/assign")
         if ml.startswith("/mgrassign"):
             rest = message[10:].strip()
-            # Extract task ID and assignee
             task_match = re.search(r"(\d+)", rest)
             assignee_match = re.search(r"@(\w+)", rest)
             if task_match and assignee_match:
