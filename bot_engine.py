@@ -2747,7 +2747,7 @@ class IntentClassifier:
             if dept is None:
                 # Fall back to LLM department classification
                 dept = self._classify_department_via_llm(message)
-            return _build("/assign", depart_slug=dept)
+            return _build("/depart_assign", depart_slug=dept)
 
         # ── LLM: handle everything remaining ─────────────────────────────────
         response = client.chat.completions.create(
@@ -2774,8 +2774,16 @@ class IntentClassifier:
         else:
             result["message"] = None
 
-        # If LLM returned /assign with no person and work context, add dept
+        # If LLM returned /assign with no person → upgrade to /depart_assign with dept
         if intent == "/assign" and not result.get("worker_slug"):
+            dept = detect_department_by_keywords(message)
+            if dept is None:
+                dept = self._classify_department_via_llm(message)
+            result["intent"] = "/depart_assign"
+            result["depart_slug"] = dept
+
+        # If LLM returned /depart_assign, ensure depart_slug is set
+        if intent == "/depart_assign" and not result.get("depart_slug"):
             dept = detect_department_by_keywords(message)
             if dept is None:
                 dept = self._classify_department_via_llm(message)
@@ -2796,11 +2804,16 @@ CRITICAL RULES
    ✅ "/tasks" triggers: "mera kaam dikhao", "my tasks", "task list", "kya karna hai"
    ❌ "/tasks" does NOT trigger for: "warehouse khali karo", "invoice bhejo", "500 units send karo"
 
-2. /assign is for ALL work instructions — with or without a named person.
-   - With a named person (worker_slug set): "@ajay invoice bhejdo", "rahul ko kaam do"
-   - Without a named person (depart_slug set): "warehouse khali karo", "invoice banao"
+2. /assign is ONLY when a specific person is named (via @mention or name).
+   - "@ajay invoice bhejdo" → /assign (worker_slug: "@ajay")
+   - "rahul ko kaam do" → /assign (worker_slug: "rahul")
 
-3. /mgrassign is ONLY when a specific task NUMBER is given with an assignee.
+3. /depart_assign is for work instructions where NO person is named.
+   - "warehouse khali karo" → /depart_assign (depart_slug: "operations")
+   - "invoice banao" → /depart_assign (depart_slug: "sales")
+   These two are MUTUALLY EXCLUSIVE. Never use /assign without a named person.
+
+4. /mgrassign is ONLY when a specific task NUMBER is given with an assignee, OR self-claim.
 
 ════════════════════════════════════════════════════════
 INTENT CLASSIFICATION RULES
@@ -2809,45 +2822,50 @@ INTENT CLASSIFICATION RULES
 1. "/tasks" — ONLY "view my tasks" requests
    Examples: "mera kaam dikhao", "my tasks", "task list", "pending tasks", "kya karna hai"
 
-2. "/assign" — Assign work to a person OR department (any work instruction)
-   With person: "ajay invoice bhejdo", "@rahul warehouse khali kro"
-   Without person: "warehouse khali karo", "500 units bhejdo", "invoice banao", "purchase karo"
-   → For no-person messages, set depart_slug to one of: operations, sales, purchase, it
+2. "/assign" — Work instruction directed at a NAMED person (@mention or name)
+   Examples: "ajay invoice bhejdo", "@rahul warehouse khali kro", "suresh ko purchase karna hai"
+   → Always set worker_slug. Never set depart_slug for this intent.
 
-3. "/mgrassign" — Assigning a task to someone, OR claiming a task for yourself ("self")
+3. "/depart_assign" — Work instruction with NO named person; route to a department
+   Examples: "warehouse khali karo", "500 units bhejdo", "invoice banao", "purchase karo",
+             "server theek karo", "material order karo"
+   → Always set depart_slug to one of: operations, sales, purchase, it
+   → worker_slug must be null
+
+4. "/mgrassign" — Assigning a specific task NUMBER to a person, OR self-claiming work
    With task number + person: "task 32 ajay ko do", "task 45 @rahul ko assign karo"
    With task number + self:   "task 32 main karunga", "task 10 khud karunga"
    Without task number (self claimed): "ye kaam main karunga", "main ye kar lunga",
      "khud karunga", "mai khud dunga", "I will do this", "main sambhal lunga"
    → For self-claim messages, set worker_slug to "self" and id to null if no number given.
 
-4. "/update" — Updating a task with comment/status
+5. "/update" — Updating a task with comment/status
 
-5. "/issue" — Reporting a new issue
+6. "/issue" — Reporting a new issue
    Examples: "issue hai", "machine kharab", "kuch kharab hai"
 
-6. "/issues" — View all active issues
+7. "/issues" — View all active issues
 
-7. "/resolve" — Marking an issue as resolved
+8. "/resolve" — Marking an issue as resolved
 
-8. "/members" — View team members
+9. "/members" — View team members
 
-9. "/report" — Generate a report
+10. "/report" — Generate a report
 
-10. "/help" — Need help with commands
+11. "/help" — Need help with commands
 
-11. "general_chat" — ONLY pure conversation: greetings, small talk, non-work
+12. "general_chat" — ONLY pure conversation: greetings, small talk, non-work
     Examples: "hello", "hi", "kaise ho", "good morning", "shukriya"
 
 ════════════════════════════════════════════════════════
 OUTPUT FORMAT
 ════════════════════════════════════════════════════════
-{"intent": "<intent_name>", "id": <int or null>, "worker_slug": "<@username, name, or null>", "depart_slug": "<operations|sales|purchase|it|null>"}
+{"intent": "<intent_name>", "id": <int or null>, "worker_slug": "<@username, name, self, or null>", "depart_slug": "<operations|sales|purchase|it|null>"}
 
 Rules:
-- worker_slug: set when a specific person is named
-- depart_slug: set when NO person is named but it's a work instruction
-- Both can be null for non-assign intents
+- /assign      → worker_slug set, depart_slug null
+- /depart_assign → depart_slug set, worker_slug null
+- All other intents → both null
 """
 
     def _parse_decision(self, raw: str) -> dict:
