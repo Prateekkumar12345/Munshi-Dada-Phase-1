@@ -2123,8 +2123,6 @@
 
 
 
-
-
 """
 bot_engine.py — Pure Intent Classifier for Worker Assistant
 No database, no worker_id, just intent classification with date extraction
@@ -2614,11 +2612,11 @@ class IntentClassifier:
 
         Layer 1 — Deterministic Python pre-filters:
           a) View tasks request → /tasks
-          b) Task + assignee pattern (task X to Y) → /mgrassign
+          b) Task + assignee pattern (task X to Y) → /mgrassign or /mgrself
           c) Any @mention or name with work → /assign (with worker_slug)
           d) Attendance words → /present / /absent
           e) Past-tense completion → /complete
-          f) Work instruction with NO person → /assign (with depart_slug)
+          f) Work instruction with NO person → /depart_assign
 
         Layer 2 — LLM for everything remaining.
         """
@@ -2642,8 +2640,7 @@ class IntentClassifier:
         # ─────────────────────────────────────────────────────────────────────
         # TASK-REFERENCE DETECTION
         # A "task reference" means the message explicitly talks about a specific
-        # task (by number, word, or ID keyword).  This is the key signal that
-        # separates /mgrassign (person + task ref) from /assign (person + work).
+        # task (by number, word, or ID keyword).
         #
         # Matches:
         #   "task 4", "task id 4", "id 4", "4 number wala task",
@@ -2674,108 +2671,105 @@ class IntentClassifier:
 
         has_task_ref, task_ref_id = _has_task_reference(message)
 
-        # Also detect the old "task\s+\d+" pattern used in pre-filter A
+        # Also detect the old "task\s+\d+" pattern
         task_id_match = re.search(r"task\s+(\d+)|(\d+)\s+task", ml)
 
-        # ── PRE-FILTER A: Manager assigns a task (by number) to a named person ─
-        # Triggers when: task reference present + person named + assignment verb
-        # "@ajay id 4 wala kaam pura kardo" → /mgrassign (id:4, worker_slug:@ajay)
-        # "task 32 ajay ko do"              → /mgrassign (id:32, worker_slug:ajay)
-        assign_keywords = [
-            r"ko\s+do", r"ko\s+de", r"ko\s+bhej", r"assign", r"allot",
-            r"de\s+do", r"bhej\s+do", r"pura\s+kar", r"kar\s+do",
-            r"khatam\s+kar", r"complete\s+kar", r"finish\s+kar",
+        # ── PRE-FILTER A: Self-assign (manager assigning task to themselves) ──
+        # Covers: "task 32 main karunga", "I will do task 32", "task 32 myself"
+        # Returns: /mgrself with id only, worker_slug = null
+        _SELF_ASSIGN_PATTERNS = [
+            r"\b(task|id|#)?\s*(\d+)\s*(main|mai|mein|me|i)\s+(karunga|kar\s+lunga|kar\s+leta\s+hu|karunga|kar\s+dunga|khud\s+karunga|will\s+do|will\s+take|'ll\s+do)\b",
+            r"\b(main|mai|mein|me|i)\s+(karunga|kar\s+lunga|kar\s+leta\s+hu|karunga|kar\s+dunga|khud\s+karunga|will\s+do|will\s+take|'ll\s+do)\s+(task|id|#)?\s*(\d+)\b",
+            r"\bkhud\s+(karunga|kar\s+lunga|kar\s+leta)\s+(task|id|#)?\s*(\d+)\b",
+            r"\b(task|id|#)?\s*(\d+)\s+(myself|khud)\b",
+            r"\b(i\s+will\s+do\s+task\s+\d+|i'll\s+do\s+task\s+\d+)\b",
         ]
-        is_mgr_assign_verb = any(re.search(kw, ml) for kw in assign_keywords)
+        
+        is_self_assign = False
+        self_task_id = None
+        
+        for pattern in _SELF_ASSIGN_PATTERNS:
+            match = re.search(pattern, ml, re.IGNORECASE | re.UNICODE)
+            if match:
+                is_self_assign = True
+                # Extract task ID (could be in different groups)
+                for group in match.groups():
+                    if group and group.isdigit():
+                        self_task_id = int(group)
+                        break
+                break
+        
+        # Also check for patterns without task reference (pure self-claim without task number)
+        _SELF_CLAIM_NO_TASK = [
+            r"\b(main|mai|mein|i)\s+(karunga|karungi|kar\s+leta|kar\s+leti|kar\s+lunga|kar\s+lungi|will\s+do|'ll\s+do)\s+(ye|this|iska|is)\s+(kaam|task)\b",
+            r"\b(ye|this)\s+(kaam|task)\s+(main|mai|mein|i)\s+(karunga|karungi|kar\s+leta|kar\s+leti)\b",
+        ]
+        
+        if not is_self_assign:
+            for pattern in _SELF_CLAIM_NO_TASK:
+                if re.search(pattern, ml, re.IGNORECASE | re.UNICODE):
+                    is_self_assign = True
+                    self_task_id = None
+                    break
+        
+        if is_self_assign and has_task_ref:
+            # If we have a task reference, use that ID
+            tid = task_ref_id if task_ref_id else self_task_id
+            if tid is None and task_id_match:
+                tid = int(task_id_match.group(1) or task_id_match.group(2))
+            if tid is None:
+                # Try to find any number in the message
+                bare_id = re.search(r"\b(\d+)\b", message)
+                if bare_id:
+                    tid = int(bare_id.group(1))
+            # Return /mgrself with worker_slug = null
+            return _build("/mgrself", tid, worker_slug=None)
 
+        # ── PRE-FILTER B: Manager assigns task to another person ─────────────
+        # Triggers when: task reference present + person named (with @ or name)
+        # "task 32 @ajay ko do" → /mgrassign (id:32, worker_slug:@ajay)
+        # "@ajay will do task 32" → /mgrassign (id:32, worker_slug:@ajay)
+        
         if has_task_ref:
-            # Resolve the task ID — prefer explicit number, fall back to task_id_match
+            # Resolve the task ID
             tid = task_ref_id
             if tid is None and task_id_match:
                 tid = int(task_id_match.group(1) or task_id_match.group(2))
-
-            # Named person present → /mgrassign
+            
+            # Check for named person (with @mention)
             at_m = re.search(r"@(\w+)", message)
             if at_m:
                 return _build("/mgrassign", tid, f"@{at_m.group(1)}")
-
+            
+            # Check for named person (without @)
             name_match = re.search(
                 r"([A-Za-z\u0900-\u097F]{2,20})\s+ko\b", message, re.UNICODE
             )
             if name_match and name_match.group(1).lower() not in self._NOT_A_NAME:
                 return _build("/mgrassign", tid, name_match.group(1))
-
-            # Old-style "task X + assign verb + name" without @
-            if task_id_match and is_mgr_assign_verb:
-                name_m2 = re.search(
-                    r"([A-Za-z\u0900-\u097F]{2,20})\b", message, re.UNICODE
-                )
-                if name_m2 and name_m2.group(1).lower() not in self._NOT_A_NAME:
-                    return _build("/mgrassign", tid, name_m2.group(1))
-
-        # ── PRE-FILTER B: Self-assign — with OR without a task # ─────────────
-        # Covers: "task 32 main karunga", "ye kaam mai khud karunga",
-        #         "main ye kar lunga", "I will do this", "mai khud dunga"
-        _SELF_PATTERNS = [
-            r"\b(main|mai|mein|me)\s+(karunga|kar\s+lunga|kar\s+leta\s+hu|karunga|kar\s+dunga|khud\s+karunga)\b",
-            r"\bkhud\s+(karunga|kar\s+lunga|kar\s+leta|karega|dunga|karunga)\b",
-            r"\b(i\s+will\s+do|i\s+will\s+take|i['']ll\s+do|i\s+will\s+handle|myself)\b",
-            r"\b(main|mai)\s+khud\b",
-            r"\bkhud\s+(main|mai|mein)\b",
-            r"\bapne\s+aap\s+(karunga|kar\s+lunga|se\s+kar)\b",
-            r"\b(le\s+leta\s+hu|le\s+lunga|kar\s+lunga|nipta\s+lunga|sambhal\s+lunga)\b",
-        ]
-        is_self_assign = any(re.search(p, ml, re.IGNORECASE | re.UNICODE) for p in _SELF_PATTERNS)
-
-        if is_self_assign:
-            tid = task_ref_id
-            if tid is None and task_id_match:
-                tid = int(task_id_match.group(1) or task_id_match.group(2))
-            if tid is None:
-                bare_id = re.search(r"\b(\d+)\b", message)
-                if bare_id:
-                    tid = int(bare_id.group(1))
-            return _build("/mgrassign", tid, "self")
+            
+            # Check for patterns like "ajay will do task 32"
+            name_before = re.match(
+                r"^([A-Za-z\u0900-\u097F]{2,20})\s+(will|ko|se)", message, re.IGNORECASE | re.UNICODE
+            )
+            if name_before and name_before.group(1).lower() not in self._NOT_A_NAME:
+                return _build("/mgrassign", tid, name_before.group(1))
 
         # ── PRE-FILTER C: @mention + NO task reference → /assign ─────────────
-        # "@ajay warehouse khali karo"  → /assign  (work, no task number)
-        # "@ajay id 4 wala karo"        → already caught above as /mgrassign
         at_m = re.search(r"@(\w+)", message)
         if at_m:
-            # Double-check: if somehow a task ref slipped through, send to /mgrassign
             if has_task_ref:
                 return _build("/mgrassign", task_ref_id, f"@{at_m.group(1)}")
             return _build("/assign", worker_slug=f"@{at_m.group(1)}")
 
         # ── PRE-FILTER D: Named person + NO task reference → /assign ──────────
-        # "ajay ko invoice bhejdo"  → /assign
-        # "ajay ko task 5 do"       → already caught above as /mgrassign
         assignee = self._extract_assignee(message)
         if assignee:
             if has_task_ref:
                 return _build("/mgrassign", task_ref_id, assignee)
             return _build("/assign", worker_slug=assignee)
 
-        # ── PRE-FILTER E0: Self-claim ("I will do this myself") → /selfassign ──
-        # Handles: "ye kaam mai khud karunga", "main karunga", "I will do it", etc.
-        # NOTE: If a specific task ID is also present, PRE-FILTER B above already
-        #       handles it as /mgrassign with worker_slug="self". This filter catches
-        #       the case where NO task number is mentioned.
-        _SELF_CLAIM_PATTERNS = [
-            r"\b(main|mai|mein|i)\s+(karunga|karungi|kar\s+leta|kar\s+leti|kar\s+lunga|kar\s+lungi|karunga|karungi)\b",
-            r"\b(khud\s+karunga|khud\s+karungi|khud\s+kar\s+leta|khud\s+kar\s+leti)\b",
-            r"\b(main|mai)\s+khud\b",
-            r"\bkhud\s+(main|mai|me)\b",
-            r"\bi\s+will\s+(do|handle|take\s+care|manage)\b",
-            r"\bi'?ll\s+(do|handle|take\s+care|manage)\b",
-            r"\bmyself\s+(karunga|karungi|kar\s+leta|kar\s+lunga)\b",
-            r"\b(le\s+leta|le\s+lunga|le\s+lungi)\b",  # "main le leta hu"
-        ]
-        is_self_claim = any(
-            re.search(p, ml, re.IGNORECASE | re.UNICODE)
-            for p in _SELF_CLAIM_PATTERNS
-        )
-        # Make sure there's no task number (those go
+        # ── PRE-FILTER E: Attendance commands ────────────────────────────────
         if re.search(
             r"\b(present\s+hu|aa\s+gaya|aaya\s+hu|pahunch\s+gaya|aaj\s+aaya|i\s+am\s+here|mai\s+aa\s+gaya|main\s+aa\s+gaya)\b",
             ml, re.IGNORECASE | re.UNICODE,
@@ -2796,8 +2790,7 @@ class IntentClassifier:
             id_m = re.search(r"\b(\d+)\b", message)
             return _build("/complete", int(id_m.group(1)) if id_m else None)
 
-        # ── PRE-FILTER G: Work instruction with NO person → /assign + depart_slug
-        # Detect whether the message sounds like a work instruction at all
+        # ── PRE-FILTER G: Work instruction with NO person → /depart_assign ────
         work_instruction_patterns = [
             r"\b(bhejo|bhej|karo|karna|krdo|krdena|banao|banana|lao|lana|chalao|chalana|"
             r"safai|clean|clear|pack|load|unload|dispatch|deliver|send|purchase|buy|"
@@ -2857,6 +2850,11 @@ class IntentClassifier:
             if dept is None:
                 dept = self._classify_department_via_llm(message)
             result["depart_slug"] = dept
+        
+        # Convert any /mgrassign with worker_slug="self" to /mgrself
+        if intent == "/mgrassign" and result.get("worker_slug") == "self":
+            result["intent"] = "/mgrself"
+            result["worker_slug"] = None
 
         return result
 
@@ -2864,26 +2862,6 @@ class IntentClassifier:
         return """You are a pure intent classification system for a WhatsApp-based worker assistant called Munshi Dada.
 Your ONLY job is to classify the user's message into exactly one intent and extract relevant IDs.
 Respond with ONLY a valid JSON object. No text, no markdown, no explanations.
-
-════════════════════════════════════════════════════════
-CRITICAL RULES
-════════════════════════════════════════════════════════
-
-1. /tasks is ONLY for viewing your own task list. NOT for work instructions.
-   ✅ "/tasks" triggers: "mera kaam dikhao", "my tasks", "task list", "kya karna hai"
-   ❌ "/tasks" does NOT trigger for: "warehouse khali karo", "invoice bhejo", "500 units send karo"
-
-2. /assign is ONLY when a person is named AND there is NO explicit task reference.
-   - "@ajay warehouse khali karo" → /assign  (work instruction, no task number)
-   - "rahul ko invoice bhejdo"   → /assign  (work instruction, no task number)
-
-3. /mgrassign is when a person is named AND there IS an explicit task reference
-   (task number, "id X", "#X", "task id X", "X wala task"), OR self-claim.
-   - "@ajay id 4 wala kaam karo"  → /mgrassign  (task ref present)
-   - "task 32 ajay ko do"         → /mgrassign  (task number present)
-   - "@rahul #7 complete karo"    → /mgrassign  (task ref present)
-   - "ye kaam mai khud karunga"   → /mgrassign  (self-claim)
-   RULE: /assign and /mgrassign are mutually exclusive on task reference presence.
 
 ════════════════════════════════════════════════════════
 INTENT CLASSIFICATION RULES
@@ -2907,51 +2885,53 @@ INTENT CLASSIFICATION RULES
    → Always set depart_slug to one of: operations, sales, purchase, it
    → worker_slug must be null
 
-4. "/mgrassign" — Person named AND an explicit task reference present (task id/number),
-   OR self-claiming work.
+4. "/mgrassign" — Manager assigns a specific task (by ID/number) to another person
    TASK REFERENCE means: a specific task number, "task X", "id X", "#X",
    "X wala task", "task id X", "task no X", "X number wala task".
-
-   With task reference + named person:
+   
+   Examples:
      "@ajay id 4 wala kaam pura kardo"    → /mgrassign (id:4,  worker_slug:@ajay)
-     "@ajay task id 4 wala kaam karo"     → /mgrassign (id:4,  worker_slug:@ajay)
      "task 32 ajay ko do"                 → /mgrassign (id:32, worker_slug:ajay)
-     "task 45 @rahul ko assign karo"      → /mgrassign (id:45, worker_slug:@rahul)
      "@rahul #7 complete karo"            → /mgrassign (id:7,  worker_slug:@rahul)
+     "ajay will do task 32"               → /mgrassign (id:32, worker_slug:ajay)
+   → worker_slug must be the person's name (with @ if mentioned)
 
-   Self-claim (with or without task number):
-     "task 32 main karunga"               → /mgrassign (id:32, worker_slug:self)
-     "ye kaam mai khud karunga"           → /mgrassign (id:null, worker_slug:self)
+5. "/mgrself" — Manager assigns a task to themselves (self-assign)
+   Examples:
+     "task 32 main karunga"               → /mgrself (id:32, worker_slug:null)
+     "I will do task 32 myself"           → /mgrself (id:32, worker_slug:null)
+     "task 18 mai khud karunga"           → /mgrself (id:18, worker_slug:null)
+     "main ye task kar lunga"              → /mgrself (id:null, worker_slug:null)
+   → worker_slug MUST be null for /mgrself
 
-   → KEY DISTINCTION from /assign: /mgrassign ALWAYS has either a task reference
-     OR worker_slug="self". Plain work instructions to a person = /assign.
+6. "/update" — Updating a task with comment/status
 
-5. "/update" — Updating a task with comment/status
-
-6. "/issue" — Reporting a new issue
+7. "/issue" — Reporting a new issue
    Examples: "issue hai", "machine kharab", "kuch kharab hai"
 
-7. "/issues" — View all active issues
+8. "/issues" — View all active issues
 
-8. "/resolve" — Marking an issue as resolved
+9. "/resolve" — Marking an issue as resolved
 
-9. "/members" — View team members
+10. "/members" — View team members
 
-10. "/report" — Generate a report
+11. "/report" — Generate a report
 
-11. "/help" — Need help with commands
+12. "/help" — Need help with commands
 
-12. "general_chat" — ONLY pure conversation: greetings, small talk, non-work
+13. "general_chat" — ONLY pure conversation: greetings, small talk, non-work
     Examples: "hello", "hi", "kaise ho", "good morning", "shukriya"
 
 ════════════════════════════════════════════════════════
 OUTPUT FORMAT
 ════════════════════════════════════════════════════════
-{"intent": "<intent_name>", "id": <int or null>, "worker_slug": "<@username, name, self, or null>", "depart_slug": "<operations|sales|purchase|it|null>"}
+{"intent": "<intent_name>", "id": <int or null>, "worker_slug": "<@username, name, or null>", "depart_slug": "<operations|sales|purchase|it|null>"}
 
 Rules:
-- /assign      → worker_slug set, depart_slug null
+- /assign      → worker_slug set (person's name), depart_slug null
 - /depart_assign → depart_slug set, worker_slug null
+- /mgrassign   → id set, worker_slug set (person's name), depart_slug null
+- /mgrself     → id set (if available), worker_slug null, depart_slug null
 - All other intents → both null
 """
 
@@ -3006,6 +2986,21 @@ class CommandParser:
             return base("/tasks")
         if ml.startswith("/complete"):
             return base("/complete", extract_leading_int(message[9:]))
+        if ml.startswith("/mgrself"):
+            rest = message[8:].strip()
+            task_match = re.search(r"(\d+)", rest)
+            if task_match:
+                return base("/mgrself", int(task_match.group(1)), None)
+            return base("/mgrself")
+        if ml.startswith("/mgrassign"):
+            rest = message[10:].strip()
+            task_match = re.search(r"(\d+)", rest)
+            assignee_match = re.search(r"@(\w+)", rest)
+            if task_match and assignee_match:
+                return base("/mgrassign", int(task_match.group(1)), f"@{assignee_match.group(1)}")
+            elif task_match:
+                return base("/mgrassign", int(task_match.group(1)), None)
+            return base("/mgrassign")
         if ml.startswith("/assign"):
             rest = message[7:].strip()
             m = re.search(r"@(\d+)", rest)
@@ -3018,15 +3013,6 @@ class CommandParser:
             if m:
                 return base("/assign", None, f"@{m.group(1)}")
             return base("/assign")
-        if ml.startswith("/mgrassign"):
-            rest = message[10:].strip()
-            task_match = re.search(r"(\d+)", rest)
-            assignee_match = re.search(r"@(\w+)", rest)
-            if task_match and assignee_match:
-                return base("/mgrassign", int(task_match.group(1)), f"@{assignee_match.group(1)}")
-            elif task_match:
-                return base("/mgrassign", int(task_match.group(1)), None)
-            return base("/mgrassign")
         if ml.startswith("/update"):
             return base("/update", extract_leading_int(message[7:]))
         if ml.startswith("/resolve"):
