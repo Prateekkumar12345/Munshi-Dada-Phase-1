@@ -915,8 +915,6 @@
 
 
 
-
-
 """
 bot_engine.py
 Production Hybrid Intent Classification Engine
@@ -1130,16 +1128,20 @@ class CommandParser:
             id=None,
             worker_slug=None,
             depart_slug=None,
+            reject_reason=None,
         ):
 
-            return {
+            result = {
                 "intent": intent,
                 "id": id,
                 "worker_slug": worker_slug,
                 "depart_slug": depart_slug,
                 "deadline": datetime_info.get("deadline"),
                 "message": None,
+                "reject_reason": reject_reason,
             }
+
+            return result
 
         # ====================================================
         # COMMANDS
@@ -1196,6 +1198,60 @@ class CommandParser:
                 int(task_id.group()) if task_id else None,
             )
 
+        # ====================================================
+        # NEW: MGRTRANSFER COMMAND
+        # ====================================================
+
+        if ml.startswith("/mgrtransfer"):
+
+            # Pattern: /mgrtransfer 12 sales
+            match = re.search(r"/mgrtransfer\s+(\d+)\s+(\w+)", message, re.IGNORECASE)
+
+            if match:
+                task_id = int(match.group(1))
+                depart_slug = match.group(2).lower()
+
+                return build(
+                    "/mgrtransfer",
+                    id=task_id,
+                    depart_slug=depart_slug,
+                )
+
+            # If pattern doesn't match, just extract task id
+            task_id = re.search(r"\d+", message)
+            return build(
+                "/mgrtransfer",
+                id=int(task_id.group()) if task_id else None,
+                depart_slug=None,
+            )
+
+        # ====================================================
+        # NEW: MGRREJECT COMMAND
+        # ====================================================
+
+        if ml.startswith("/mgrreject"):
+
+            # Pattern: /mgrreject 12 not our department scope
+            match = re.match(r"/mgrreject\s+(\d+)\s+(.*)", message, re.IGNORECASE)
+
+            if match:
+                task_id = int(match.group(1))
+                reason = match.group(2).strip()
+
+                return build(
+                    "/mgrreject",
+                    id=task_id,
+                    reject_reason=reason,
+                )
+
+            # If only task id provided
+            task_id = re.search(r"\d+", message)
+            return build(
+                "/mgrreject",
+                id=int(task_id.group()) if task_id else None,
+                reject_reason=None,
+            )
+
         return None
 
 
@@ -1222,6 +1278,8 @@ class IntentClassifier:
         "/present",
         "/absent",
         "/complete",
+        "/mgrtransfer",  # NEW
+        "/mgrreject",    # NEW
         "general_chat",
     }
 
@@ -1284,6 +1342,35 @@ class IntentClassifier:
 
         return None
 
+    def extract_reject_reason(self, message: str):
+
+        # Extract reason after task reference patterns
+        patterns = [
+            r"(?:reject|rejection)\s+(?:task\s+)?(\d+)\s+(?:because|reason|:)?\s*(.+)",
+            r"(?:task\s+)?(\d+)\s+(?:is|was)\s+rejected\s+(?:because|as|since)?\s*(.+)",
+            r"wrong\s+department\s*(?:for\s+)?(?:task\s+)?(\d+)?",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                if len(match.groups()) == 2 and match.group(2):
+                    return match.group(2).strip()
+                elif match.group(1) and not match.group(2):
+                    return "No reason provided"
+                elif "wrong department" in message.lower():
+                    return "Wrong department"
+
+        # Check for common rejection phrases
+        if "wrong department" in message.lower():
+            return "Task assigned to wrong department"
+        if "not our scope" in message.lower():
+            return "Task not in department scope"
+        if "not my department" in message.lower():
+            return "Task does not belong to this department"
+
+        return None
+
     # ========================================================
     # LLM CLASSIFICATION
     # ========================================================
@@ -1319,6 +1406,7 @@ class IntentClassifier:
                 "intent": "general_chat",
                 "worker_slug": None,
                 "depart_slug": None,
+                "reject_reason": None,
             }
 
     # ========================================================
@@ -1332,6 +1420,8 @@ class IntentClassifier:
         task_id = self.extract_task_id(message)
 
         mention = self.extract_mentions(message)
+
+        reject_reason = self.extract_reject_reason(message)
 
         llm_result = self.llm_classify(message)
 
@@ -1347,6 +1437,10 @@ class IntentClassifier:
         worker_slug = llm_result.get("worker_slug")
 
         depart_slug = llm_result.get("depart_slug")
+
+        # For mgrreject, get reject reason from LLM result or extracted
+        reject_reason_from_llm = llm_result.get("reject_reason")
+        final_reject_reason = reject_reason_from_llm or reject_reason
 
         # mention override
         if mention and not worker_slug:
@@ -1365,6 +1459,7 @@ class IntentClassifier:
             "depart_slug": depart_slug,
             "deadline": datetime_info.get("deadline"),
             "message": None,
+            "reject_reason": final_reject_reason if intent == "/mgrreject" else None,
         }
 
         # general response
@@ -1668,7 +1763,45 @@ Examples:
 
 ========================================================
 
-16. general_chat
+16. /mgrtransfer
+
+Transfer an existing task to another department.
+
+The task is sent to the target department's manager
+with a fresh routing prompt.
+
+Examples:
+- transfer task 12 to sales department
+- task 15 ko it department bhejo
+- move task 8 to operations
+- reassign task 20 to purchase
+
+Rules:
+- task id required
+- depart_slug required (operations|sales|purchase|it)
+
+========================================================
+
+17. /mgrreject
+
+Reject a task with a reason.
+
+Owner receives notification with reason and manager details.
+Task status becomes REJECTED_BY_MANAGER.
+
+Examples:
+- reject task 12 - wrong department
+- task 15 reject karo, not our scope
+- isko reject karo, ye sales ka kaam hai
+- reject task 8 - out of scope
+
+Rules:
+- task id required
+- reject_reason extracted from message
+
+========================================================
+
+18. general_chat
 
 Casual conversation only.
 
@@ -1724,10 +1857,27 @@ OUTPUT FORMAT
 
 Return ONLY valid JSON.
 
+For /mgrtransfer:
+{
+  "intent": "/mgrtransfer",
+  "worker_slug": null,
+  "depart_slug": "operations|sales|purchase|it"
+}
+
+For /mgrreject:
+{
+  "intent": "/mgrreject",
+  "worker_slug": null,
+  "depart_slug": null,
+  "reject_reason": "string"
+}
+
+For other intents:
 {
   "intent": "string",
   "worker_slug": "string or null",
-  "depart_slug": "operations|sales|purchase|it|null"
+  "depart_slug": "operations|sales|purchase|it|null",
+  "reject_reason": null
 }
 
 ========================================================
@@ -1738,6 +1888,8 @@ STRICT RULES
 - /mgrassign => worker_slug required
 - /depart_assign => depart_slug required
 - /mgrself => worker_slug null
+- /mgrtransfer => depart_slug required, worker_slug null
+- /mgrreject => reject_reason optional but recommended
 - all others => both null
 
 Never return explanations.

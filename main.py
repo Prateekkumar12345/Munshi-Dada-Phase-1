@@ -262,11 +262,6 @@
 
 
 
-
-
-
-
-
 """
 main.py
 FastAPI Backend
@@ -347,6 +342,8 @@ class ClassifyResponse(BaseModel):
     deadline: Optional[str] = None
 
     message: Optional[str] = None
+
+    reject_reason: Optional[str] = None  # NEW: for mgrreject
 
 
 # ============================================================
